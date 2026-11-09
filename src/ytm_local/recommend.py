@@ -15,6 +15,8 @@ import re
 import sqlite3
 from collections import Counter
 
+from .download import MAX_SECONDS
+
 SOURCE_WEIGHT = {"liked": 1.0, "library": 0.3}
 PLAYLIST_WEIGHT = 0.5
 
@@ -42,7 +44,13 @@ def recommend_now(
     def is_local(r) -> bool:
         return r["status"] == "done" and r["path"] is not None
 
-    rows = [r for r in everything if (scope == "all") or (is_local(r) if scope == "local" else not is_local(r))]
+    def is_song(r) -> bool:  # shows/lives de horas nas curtidas não entram nas sugestões
+        return r["duration"] is None or r["duration"] <= MAX_SECONDS
+
+    rows = [
+        r for r in everything
+        if is_song(r) and ((scope == "all") or (is_local(r) if scope == "local" else not is_local(r)))
+    ]
     if not rows:
         return []
 

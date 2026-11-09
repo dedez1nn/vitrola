@@ -30,8 +30,23 @@ pub struct Player {
 }
 
 impl Player {
+    /// Remove sockets de instâncias que morreram sem limpar (SIGKILL, crash).
+    fn clean_stale_sockets(dir: &std::path::Path) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let pid = name.strip_prefix("toca-mpv-").and_then(|r| r.strip_suffix(".sock"));
+            if let Some(pid) = pid {
+                if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+
     pub fn new() -> Self {
         let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        Self::clean_stale_sockets(&dir);
         Player {
             child: None,
             sock: dir.join(format!("toca-mpv-{}.sock", std::process::id())),
