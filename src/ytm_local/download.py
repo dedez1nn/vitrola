@@ -40,7 +40,14 @@ def build_opts(out_dir: Path, cookies_browser: str | None, cookies_file: Path | 
 DEFAULT_SECONDS = 210  # duração assumida quando a faixa não informa
 
 
-def pending_rows(conn: sqlite3.Connection, limit: int | None, retry_failed: bool) -> list[sqlite3.Row]:
+def pending_rows(
+    conn: sqlite3.Connection, limit: int | None, retry_failed: bool, ids: list[str] | None = None
+) -> list[sqlite3.Row]:
+    if ids:  # download explícito por ID, ignora o status
+        marks = ",".join("?" * len(ids))
+        return conn.execute(
+            f"SELECT video_id, title, artists, duration FROM tracks WHERE video_id IN ({marks})", ids
+        ).fetchall()
     statuses = ("pending", "failed") if retry_failed else ("pending",)
     marks = ",".join("?" * len(statuses))
     sql = f"SELECT video_id, title, artists, duration FROM tracks WHERE status IN ({marks}) ORDER BY added_at"

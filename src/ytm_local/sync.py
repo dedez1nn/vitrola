@@ -13,7 +13,9 @@ def _normalize(raw: dict) -> dict | None:
     if not video_id:  # faixa removida/indisponível
         return None
     album = raw.get("album") or {}
+    thumbs = raw.get("thumbnails") or []
     return {
+        "thumbnail": thumbs[-1].get("url") if thumbs else None,
         "video_id": video_id,
         "title": raw.get("title") or "",
         "artists": ", ".join(a["name"] for a in raw.get("artists") or [] if a.get("name")),

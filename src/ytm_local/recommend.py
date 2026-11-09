@@ -30,11 +30,19 @@ def recommend_now(
     mode: str = "fresh",  # fresh = favoritas esquecidas | again = o que você anda ouvindo
     temperature: float = 0.6,
     rng: random.Random | None = None,
+    scope: str = "local",  # local = só no disco | cloud = só nuvem | all = os dois (disco ganha um bônus)
 ) -> list[dict]:
     rng = rng or random.Random()
-    rows = conn.execute(
-        "SELECT video_id, title, artists, path, duration FROM tracks WHERE status='done' AND path IS NOT NULL"
+    everything = conn.execute(
+        "SELECT video_id, title, artists, path, duration, status FROM tracks"
     ).fetchall()
+    # a afinidade vem da biblioteca inteira, não só do recorte pedido
+    artist_count = Counter(first_artist(r["artists"]) for r in everything)
+
+    def is_local(r) -> bool:
+        return r["status"] == "done" and r["path"] is not None
+
+    rows = [r for r in everything if (scope == "all") or (is_local(r) if scope == "local" else not is_local(r))]
     if not rows:
         return []
 
@@ -50,7 +58,6 @@ def recommend_now(
         )
     }
 
-    artist_count = Counter(first_artist(r["artists"]) for r in rows)
     has_history = any("history" in s for s in sources.values())
 
     scored = []
@@ -88,7 +95,9 @@ def recommend_now(
             score -= 2.0 * math.exp(-days / 3)  # meia-vida de ~2 dias
             why.append(f"tocada há {days:.0f}d")
 
-        scored.append({**dict(r), "score": score, "why": why, "artist": artist})
+        if scope == "all" and is_local(r):
+            score += 0.5  # empate: o que está no disco vem primeiro
+        scored.append({**dict(r), "score": score, "why": why, "artist": artist, "local": is_local(r)})
 
     # seleção gulosa: ruído de exploração + penalidade de diversidade por artista
     picked, used = [], Counter()

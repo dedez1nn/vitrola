@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS tracks (
     artists    TEXT NOT NULL DEFAULT '',
     album      TEXT NOT NULL DEFAULT '',
     duration   INTEGER,
+    thumbnail  TEXT,
     status     TEXT NOT NULL DEFAULT 'pending',  -- pending | done | failed
     path       TEXT,
     error      TEXT,
@@ -42,16 +43,26 @@ def connect(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(tracks)")}
+    if "thumbnail" not in cols:  # bancos criados antes das capas
+        conn.execute("ALTER TABLE tracks ADD COLUMN thumbnail TEXT")
+        conn.commit()
     return conn
 
 
 def upsert_track(conn: sqlite3.Connection, t: dict, source: str) -> bool:
     """Insere a faixa se nova. Retorna True se for inédita."""
+    t = {"thumbnail": None, **t}
     cur = conn.execute(
-        "INSERT OR IGNORE INTO tracks (video_id, title, artists, album, duration) "
-        "VALUES (:video_id, :title, :artists, :album, :duration)",
+        "INSERT OR IGNORE INTO tracks (video_id, title, artists, album, duration, thumbnail) "
+        "VALUES (:video_id, :title, :artists, :album, :duration, :thumbnail)",
         t,
     )
+    if t["thumbnail"]:  # faixas já existentes ganham a capa no próximo sync
+        conn.execute(
+            "UPDATE tracks SET thumbnail=? WHERE video_id=? AND thumbnail IS NULL",
+            (t["thumbnail"], t["video_id"]),
+        )
     conn.execute(
         "INSERT OR IGNORE INTO sources (video_id, source) VALUES (?, ?)",
         (t["video_id"], source),

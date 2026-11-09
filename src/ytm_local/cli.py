@@ -1,6 +1,7 @@
 """CLI: auth -> sync -> download -> status."""
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -9,6 +10,7 @@ from pathlib import Path
 from ytmusicapi import YTMusic, setup
 
 from .db import connect
+from .covers import fetch_missing
 from .discover import discover
 from .recommend import recommend_now
 from .download import download_pending, estimate_bytes, pending_rows
@@ -79,12 +81,20 @@ def cmd_sync(args) -> None:
     conn = connect(DB_FILE)
     for name, (seen, new) in sync(conn, AUTH_FILE, sources, args.limit).items():
         print(f"{name}: {seen} faixas, {new} novas")
+    ok, fail = fetch_missing(conn)
+    if ok or fail:
+        print(f"Capas: {ok} baixadas, {fail} falhas")
     _print_pending_estimate(conn, args.bitrate)
+
+
+def cmd_covers(args) -> None:
+    ok, fail = fetch_missing(connect(DB_FILE))
+    print(f"Capas: {ok} baixadas, {fail} falhas")
 
 
 def cmd_download(args) -> None:
     conn = connect(DB_FILE)
-    rows = pending_rows(conn, args.limit, args.retry_failed)
+    rows = pending_rows(conn, args.limit, args.retry_failed, args.id)
     if not rows:
         print("Nada pendente.")
         return
@@ -108,7 +118,14 @@ def cmd_download(args) -> None:
 
 def cmd_recommend(args) -> None:
     conn = connect(DB_FILE)
-    picks = recommend_now(conn, args.n, args.mode, args.temperature)
+    picks = recommend_now(conn, args.n, args.mode, args.temperature, scope=args.scope)
+    if args.json:
+        print(json.dumps([
+            {"video_id": t["video_id"], "title": t["title"], "artists": t["artists"],
+             "local": t["local"], "path": t["path"] if t["local"] else None}
+            for t in picks
+        ], ensure_ascii=False))
+        return
     if not picks:
         raise SystemExit("Nenhuma faixa baixada ainda. Rode: ytm-local download")
     for i, t in enumerate(picks, 1):
@@ -118,6 +135,7 @@ def cmd_recommend(args) -> None:
     if args.play:
         if not shutil.which("mpv"):
             raise SystemExit("mpv não encontrado.")
+        picks = [t for t in picks if t["local"]]
         conn.executemany("INSERT INTO plays (video_id) VALUES (?)", [(t["video_id"],) for t in picks])
         conn.commit()
         subprocess.run(["mpv", "--no-video", *[t["path"] for t in picks]])
@@ -180,6 +198,7 @@ def main() -> None:
     d.add_argument("--retry-failed", action="store_true")
     d.add_argument("--bitrate", type=int, default=256,
                    help="kbps usado na estimativa de tamanho (256 com Premium, ~128 sem)")
+    d.add_argument("--id", action="append", help="baixa só este video_id (repetível)")
     d.add_argument("-y", "--yes", action="store_true", help="não pedir confirmação")
     d.set_defaults(fn=cmd_download)
 
@@ -188,6 +207,8 @@ def main() -> None:
     r.add_argument("--mode", choices=["fresh", "again"], default="fresh",
                    help="fresh: favoritas esquecidas; again: o que você anda ouvindo")
     r.add_argument("--temperature", type=float, default=0.6, help="0 = sempre o topo; maior = mais variedade")
+    r.add_argument("--scope", choices=["local", "cloud", "all"], default="local")
+    r.add_argument("--json", action="store_true", help="saída para o app")
     r.add_argument("--play", action="store_true", help="toca com mpv e registra como tocadas")
     r.set_defaults(fn=cmd_recommend)
 
@@ -197,6 +218,8 @@ def main() -> None:
     dv.add_argument("--new-artists", action="store_true", help="só artistas que você ainda não tem")
     dv.add_argument("--add", type=int, metavar="N", help="coloca as N primeiras na fila de download")
     dv.set_defaults(fn=cmd_discover)
+
+    sub.add_parser("covers", help="baixa as capas que faltam para o cache").set_defaults(fn=cmd_covers)
 
     st = sub.add_parser("status", help="resumo do estado")
     st.add_argument("--bitrate", type=int, default=256, help="kbps usado na estimativa de tamanho")
