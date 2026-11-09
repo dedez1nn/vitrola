@@ -10,7 +10,6 @@ from pathlib import Path
 from ytmusicapi import YTMusic, setup
 
 from .db import connect
-from .covers import fetch_missing
 from .discover import discover
 from .recommend import recommend_now
 from .download import download_pending, estimate_bytes, pending_rows
@@ -81,15 +80,7 @@ def cmd_sync(args) -> None:
     conn = connect(DB_FILE)
     for name, (seen, new) in sync(conn, AUTH_FILE, sources, args.limit).items():
         print(f"{name}: {seen} faixas, {new} novas")
-    ok, fail = fetch_missing(conn)
-    if ok or fail:
-        print(f"Capas: {ok} baixadas, {fail} falhas")
     _print_pending_estimate(conn, args.bitrate)
-
-
-def cmd_covers(args) -> None:
-    ok, fail = fetch_missing(connect(DB_FILE))
-    print(f"Capas: {ok} baixadas, {fail} falhas")
 
 
 def cmd_download(args) -> None:
@@ -122,7 +113,7 @@ def cmd_recommend(args) -> None:
     if args.json:
         print(json.dumps([
             {"video_id": t["video_id"], "title": t["title"], "artists": t["artists"],
-             "local": t["local"], "path": t["path"] if t["local"] else None}
+             "local": t["local"], "path": t["path"] if t["local"] else None, "thumbnail": t["thumbnail"]}
             for t in picks
         ], ensure_ascii=False))
         return
@@ -218,8 +209,6 @@ def main() -> None:
     dv.add_argument("--new-artists", action="store_true", help="só artistas que você ainda não tem")
     dv.add_argument("--add", type=int, metavar="N", help="coloca as N primeiras na fila de download")
     dv.set_defaults(fn=cmd_discover)
-
-    sub.add_parser("covers", help="baixa as capas que faltam para o cache").set_defaults(fn=cmd_covers)
 
     st = sub.add_parser("status", help="resumo do estado")
     st.add_argument("--bitrate", type=int, default=256, help="kbps usado na estimativa de tamanho")

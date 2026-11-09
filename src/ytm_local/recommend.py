@@ -34,7 +34,7 @@ def recommend_now(
 ) -> list[dict]:
     rng = rng or random.Random()
     everything = conn.execute(
-        "SELECT video_id, title, artists, path, duration, status FROM tracks"
+        "SELECT video_id, title, artists, path, duration, status, thumbnail FROM tracks"
     ).fetchall()
     # a afinidade vem da biblioteca inteira, não só do recorte pedido
     artist_count = Counter(first_artist(r["artists"]) for r in everything)

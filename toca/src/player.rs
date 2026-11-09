@@ -1,0 +1,164 @@
+//! Player: um processo `mpv` por faixa, controlado por IPC. Sem faixa tocando não há processo (RAM zero).
+
+use crate::db::Track;
+use std::{
+    fs,
+    io::{BufRead, BufReader, Write},
+    os::unix::net::UnixStream,
+    process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::Sender,
+        Arc, Mutex,
+    },
+    thread,
+    time::Duration,
+};
+
+pub enum MpvEv {
+    Time(f64),
+    Duration(f64),
+    Pause(bool),
+    End(String),
+}
+
+pub struct Player {
+    child: Option<Child>,
+    sock: std::path::PathBuf,
+    writer: Arc<Mutex<Option<UnixStream>>>,
+    gen: Arc<AtomicU64>,
+}
+
+impl Player {
+    pub fn new() -> Self {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        Player {
+            child: None,
+            sock: dir.join(format!("toca-mpv-{}.sock", std::process::id())),
+            writer: Arc::new(Mutex::new(None)),
+            gen: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn gen(&self) -> u64 {
+        self.gen.load(Ordering::SeqCst)
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        *self.writer.lock().unwrap() = None;
+        let _ = fs::remove_file(&self.sock);
+    }
+
+    pub fn play(&mut self, t: &Track, tx: Sender<(u64, MpvEv)>) {
+        self.stop();
+        let gen = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let mut cmd = Command::new("mpv");
+        cmd.args([
+            "--no-video", "--no-terminal", "--no-config", "--really-quiet", "--audio-display=no",
+            "--cache-secs=30", "--demuxer-max-bytes=8MiB", "--demuxer-max-back-bytes=1MiB",
+        ])
+        .arg(format!("--input-ipc-server={}", self.sock.display()));
+        let target = match (&t.path, t.local) {
+            (Some(p), true) => p.clone(),
+            _ => {
+                cmd.args(["--ytdl=yes", "--ytdl-format=bestaudio", "--ytdl-raw-options=cookies-from-browser=firefox"]);
+                format!("https://music.youtube.com/watch?v={}", t.id)
+            }
+        };
+        cmd.arg(target).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        match cmd.spawn() {
+            Ok(c) => self.child = Some(c),
+            Err(_) => {
+                let _ = tx.send((gen, MpvEv::End("error".into())));
+                return;
+            }
+        }
+
+        let sock = self.sock.clone();
+        let writer = self.writer.clone();
+        let cur = self.gen.clone();
+        thread::spawn(move || {
+            let mut stream = None;
+            for _ in 0..150 {
+                // até ~15 s: o mpv da nuvem demora para resolver o stream
+                if cur.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                if let Ok(s) = UnixStream::connect(&sock) {
+                    stream = Some(s);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            let Some(mut s) = stream else {
+                let _ = tx.send((gen, MpvEv::End("error".into())));
+                return;
+            };
+            for (i, p) in ["time-pos", "duration", "pause"].iter().enumerate() {
+                let _ = writeln!(s, r#"{{"command":["observe_property",{},"{}"]}}"#, i + 1, p);
+            }
+            if let Ok(w) = s.try_clone() {
+                if cur.load(Ordering::SeqCst) == gen {
+                    *writer.lock().unwrap() = Some(w);
+                }
+            }
+            let mut last = -1.0_f64;
+            for line in BufReader::new(s).lines().map_while(Result::ok) {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                match v["event"].as_str() {
+                    Some("property-change") => match (v["name"].as_str(), &v["data"]) {
+                        (Some("time-pos"), d) => {
+                            if let Some(t) = d.as_f64() {
+                                if (t - last).abs() >= 0.5 {
+                                    last = t;
+                                    let _ = tx.send((gen, MpvEv::Time(t)));
+                                }
+                            }
+                        }
+                        (Some("duration"), d) => {
+                            if let Some(t) = d.as_f64() {
+                                let _ = tx.send((gen, MpvEv::Duration(t)));
+                            }
+                        }
+                        (Some("pause"), d) => {
+                            if let Some(b) = d.as_bool() {
+                                let _ = tx.send((gen, MpvEv::Pause(b)));
+                            }
+                        }
+                        _ => {}
+                    },
+                    Some("end-file") => {
+                        let r = v["reason"].as_str().unwrap_or("eof").to_string();
+                        let _ = tx.send((gen, MpvEv::End(r)));
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    fn send(&self, json: &str) {
+        if let Some(w) = self.writer.lock().unwrap().as_mut() {
+            let _ = writeln!(w, "{json}");
+        }
+    }
+
+    pub fn toggle_pause(&self) {
+        self.send(r#"{"command":["cycle","pause"]}"#);
+    }
+
+    pub fn seek(&self, secs: f64) {
+        self.send(&format!(r#"{{"command":["seek",{secs},"absolute"]}}"#));
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
