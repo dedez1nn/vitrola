@@ -20,6 +20,20 @@ CREATE TABLE IF NOT EXISTS sources (
     source   TEXT NOT NULL,  -- liked | library | history | playlist:<nome>
     PRIMARY KEY (video_id, source)
 );
+CREATE TABLE IF NOT EXISTS plays (
+    video_id  TEXT NOT NULL,
+    played_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS discoveries (
+    video_id TEXT PRIMARY KEY,
+    title    TEXT NOT NULL,
+    artists  TEXT NOT NULL DEFAULT '',
+    album    TEXT NOT NULL DEFAULT '',
+    duration INTEGER,
+    score    REAL NOT NULL,
+    reason   TEXT NOT NULL DEFAULT '',
+    seen_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 

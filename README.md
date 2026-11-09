@@ -29,3 +29,18 @@ Estado em `~/.local/share/ytm-local/state.db`, músicas em `~/Music/ytm-local`
 - Tags a partir do banco (mutagen) e pasta `Artista/Álbum/NN Faixa`.
 - `sync` periódico via systemd timer.
 - Servir com Navidrome.
+
+## Recomendação e descoberta
+
+```bash
+uv run ytm-local recommend              # o que ouvir agora (só faixas já baixadas)
+uv run ytm-local recommend -n 20 --mode again --play   # o que você anda ouvindo, tocando no mpv
+uv run ytm-local discover               # músicas novas, a partir da rádio das suas favoritas
+uv run ytm-local discover --new-artists --add 10        # só artistas novos; 10 vão para a fila de download
+```
+
+`recommend` pontua por afinidade com o artista, fonte (curtida > playlist > biblioteca), "favorita esquecida"
+(fora do histórico), repetição recente (o que o `--play` já tocou é penalizado) e diversidade de artistas, com um
+pouco de aleatoriedade (`--temperature`). `discover` sorteia sementes entre as favoritas, pega a rádio do YouTube
+Music de cada uma e ordena pelo que aparece em mais rádios; o que você já tem fica de fora.
+Rode `sync history` para o `recommend` usar o histórico.

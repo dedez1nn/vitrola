@@ -3,11 +3,14 @@
 import argparse
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
-from ytmusicapi import setup
+from ytmusicapi import YTMusic, setup
 
 from .db import connect
+from .discover import discover
+from .recommend import recommend_now
 from .download import download_pending, estimate_bytes, pending_rows
 from .sync import sync
 
@@ -103,6 +106,45 @@ def cmd_download(args) -> None:
     print(f"Concluído: {ok} baixadas, {fail} falhas")
 
 
+def cmd_recommend(args) -> None:
+    conn = connect(DB_FILE)
+    picks = recommend_now(conn, args.n, args.mode, args.temperature)
+    if not picks:
+        raise SystemExit("Nenhuma faixa baixada ainda. Rode: ytm-local download")
+    for i, t in enumerate(picks, 1):
+        print(f"{i:2}. {t['artists']} - {t['title']}")
+        if t["why"]:
+            print(f"    ({'; '.join(t['why'])})")
+    if args.play:
+        if not shutil.which("mpv"):
+            raise SystemExit("mpv não encontrado.")
+        conn.executemany("INSERT INTO plays (video_id) VALUES (?)", [(t["video_id"],) for t in picks])
+        conn.commit()
+        subprocess.run(["mpv", "--no-video", *[t["path"] for t in picks]])
+
+
+def cmd_discover(args) -> None:
+    if not AUTH_FILE.exists():
+        raise SystemExit("Sem autenticação. Rode: ytm-local auth --from-browser firefox")
+    conn = connect(DB_FILE)
+    found = discover(conn, YTMusic(str(AUTH_FILE)), args.seeds, args.new_artists)
+    if not found:
+        raise SystemExit("Nada novo encontrado (ou sem faixas na biblioteca).")
+    top = found[: args.top]
+    for i, t in enumerate(top, 1):
+        print(f"{i:2}. {t['artists']} - {t['title']}")
+        print(f"    ({t['reason']})")
+    print(f"\n{len(found)} candidatas no total, salvas em 'discoveries'.")
+    if args.add:
+        for t in top[: args.add]:
+            conn.execute(
+                "INSERT OR IGNORE INTO tracks (video_id, title, artists, album, duration) "
+                "VALUES (:video_id, :title, :artists, :album, :duration)", t)
+            conn.execute("INSERT OR IGNORE INTO sources (video_id, source) VALUES (?, 'discover')", (t["video_id"],))
+        conn.commit()
+        print(f"{min(args.add, len(top))} adicionadas à fila de download (rode: ytm-local download).")
+
+
 def cmd_status(args) -> None:
     conn = connect(DB_FILE)
     for r in conn.execute("SELECT status, COUNT(*) n FROM tracks GROUP BY status"):
@@ -140,6 +182,21 @@ def main() -> None:
                    help="kbps usado na estimativa de tamanho (256 com Premium, ~128 sem)")
     d.add_argument("-y", "--yes", action="store_true", help="não pedir confirmação")
     d.set_defaults(fn=cmd_download)
+
+    r = sub.add_parser("recommend", help="sugere o que ouvir agora (faixas já baixadas)")
+    r.add_argument("-n", type=int, default=10, help="quantas faixas")
+    r.add_argument("--mode", choices=["fresh", "again"], default="fresh",
+                   help="fresh: favoritas esquecidas; again: o que você anda ouvindo")
+    r.add_argument("--temperature", type=float, default=0.6, help="0 = sempre o topo; maior = mais variedade")
+    r.add_argument("--play", action="store_true", help="toca com mpv e registra como tocadas")
+    r.set_defaults(fn=cmd_recommend)
+
+    dv = sub.add_parser("discover", help="sugere músicas novas com base nas suas favoritas")
+    dv.add_argument("--seeds", type=int, default=8, help="quantas favoritas usar como ponto de partida")
+    dv.add_argument("--top", type=int, default=20, help="quantas mostrar")
+    dv.add_argument("--new-artists", action="store_true", help="só artistas que você ainda não tem")
+    dv.add_argument("--add", type=int, metavar="N", help="coloca as N primeiras na fila de download")
+    dv.set_defaults(fn=cmd_discover)
 
     st = sub.add_parser("status", help="resumo do estado")
     st.add_argument("--bitrate", type=int, default=256, help="kbps usado na estimativa de tamanho")
