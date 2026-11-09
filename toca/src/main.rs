@@ -55,6 +55,8 @@ enum Msg {
     ClearUpcoming,
     Volume(f64),
     ToggleMute,
+    Similar(String, Vec<Track>),
+    SetStyle(bool),
 }
 
 type Tx = Sender<Msg>;
@@ -110,7 +112,8 @@ listview > row:hover { background: #1D212A; }
 .qrow.current .ctitle { color: #4ADE9C; }
 .rm { background: transparent; border: none; box-shadow: none; color: #A3ACB8; min-width: 32px; min-height: 32px; padding: 0; border-radius: 999px; }
 .rm:hover { background: #2A2F3A; color: #ECEEF1; }
-.np-check { color: #ECEEF1; }
+.chip { background: transparent; border: 1px solid #2A2F3A; color: #A3ACB8; border-radius: 999px; padding: 0 14px; min-height: 30px; box-shadow: none; }
+.chip:checked { background: #12281F; border-color: #4ADE9C; color: #4ADE9C; }
 .current { background: #1D212A; border-radius: 8px; }
 progressbar trough { background: #2A2F3A; min-height: 6px; }
 progressbar progress { background: #4ADE9C; min-height: 6px; }
@@ -147,7 +150,8 @@ struct NowW {
     artist: gtk::Label,
     badge: gtk::Label,
     count: gtk::Label,
-    auto: gtk::CheckButton,
+    auto: gtk::ToggleButton,
+    style: gtk::ToggleButton,
     store: gio::ListStore,
     lv: gtk::ListView,
 }
@@ -179,6 +183,7 @@ struct App {
     radio: bool,
     fetching_more: bool,
     now_open: bool,
+    style: bool, // fila por estilo (rádio da faixa) em vez de sugestões gerais
 }
 
 fn vol_icon(v: f64, muted: bool) -> &'static str {
@@ -397,8 +402,8 @@ fn make_now_page(tx: &Tx) -> NowW {
     let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     let tab = label("A SEGUIR", "tab");
     tab.set_hexpand(true);
-    let auto = gtk::CheckButton::with_label("Autoplay");
-    auto.add_css_class("np-check");
+    let auto = gtk::ToggleButton::with_label("Autoplay");
+    auto.add_css_class("chip");
     auto.set_tooltip_text(Some("Adiciona músicas parecidas quando a fila acabar"));
     auto.connect_toggled({
         let tx = tx.clone();
@@ -416,8 +421,23 @@ fn make_now_page(tx: &Tx) -> NowW {
         }
     });
     tabs.append(&tab);
-    tabs.append(&auto);
-    tabs.append(&clear);
+    let style = gtk::ToggleButton::with_label("Mesmo estilo");
+    style.add_css_class("chip");
+    style.set_active(true); // antes de ligar o sinal
+    style.set_tooltip_text(Some("A fila segue o estilo da música que está tocando (rádio do YouTube Music)"));
+    style.connect_toggled({
+        let tx = tx.clone();
+        move |b| {
+            let _ = tx.send_blocking(Msg::SetStyle(b.is_active()));
+        }
+    });
+    let opts = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    let grow = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    grow.set_hexpand(true);
+    opts.append(&style);
+    opts.append(&auto);
+    opts.append(&grow);
+    opts.append(&clear);
     let count = label("", "dim");
 
     let store = gio::ListStore::new::<glib::BoxedAnyObject>();
@@ -490,13 +510,14 @@ fn make_now_page(tx: &Tx) -> NowW {
     sw.set_vexpand(true);
     sw.set_hscrollbar_policy(gtk::PolicyType::Never);
     right.append(&tabs);
+    right.append(&opts);
     right.append(&count);
     right.append(&sw);
 
     body.append(&left);
     body.append(&right);
     root.append(&body);
-    NowW { root, pic, title, artist, badge, count, auto, store, lv }
+    NowW { root, pic, title, artist, badge, count, auto, style, store, lv }
 }
 
 /// Preenche a página com a faixa atual e a fila inteira (rola até a que está tocando).
@@ -513,6 +534,9 @@ fn fill_now(a: &App) {
     fill(&n.store, a.queue.clone());
     if n.auto.is_active() != a.radio {
         n.auto.set_active(a.radio);
+    }
+    if n.style.is_active() != a.style {
+        n.style.set_active(a.style);
     }
     n.lv.scroll_to(a.idx as u32, gtk::ListScrollFlags::NONE, None);
 }
@@ -544,28 +568,40 @@ fn refresh_progress(a: &App) {
     a.ui.progress_label.set_text(&format!("{done} de {total} no disco"));
 }
 
-/// Roda `ytm-local recommend` (bloqueante; chamar fora da thread da interface).
-fn fetch_recs(scope: Scope, n: usize) -> Vec<Track> {
-    let out = Command::new(db::ytm_cmd())
-        .args(["recommend", "--scope", scope.arg(), "-n", &n.to_string(), "--json"])
-        .output();
+fn parse_tracks(stdout: &[u8]) -> Vec<Track> {
     let mut tracks = vec![];
-    if let Ok(o) = out {
-        if let Ok(serde_json::Value::Array(items)) = serde_json::from_slice(&o.stdout) {
-            for v in items {
-                let s = |k: &str| v[k].as_str().map(String::from);
-                tracks.push(Track {
-                    id: s("video_id").unwrap_or_default(),
-                    title: s("title").unwrap_or_default(),
-                    artists: s("artists").unwrap_or_default(),
-                    local: v["local"].as_bool().unwrap_or(false),
-                    path: s("path"),
-                    thumb: s("thumbnail"),
-                });
-            }
+    if let Ok(serde_json::Value::Array(items)) = serde_json::from_slice(stdout) {
+        for v in items {
+            let s = |k: &str| v[k].as_str().map(String::from);
+            tracks.push(Track {
+                id: s("video_id").unwrap_or_default(),
+                title: s("title").unwrap_or_default(),
+                artists: s("artists").unwrap_or_default(),
+                local: v["local"].as_bool().unwrap_or(false),
+                path: s("path"),
+                thumb: s("thumbnail"),
+            });
         }
     }
     tracks
+}
+
+/// Roda `ytm-local recommend` (bloqueante; chamar fora da thread da interface).
+fn fetch_recs(scope: Scope, n: usize) -> Vec<Track> {
+    Command::new(db::ytm_cmd())
+        .args(["recommend", "--scope", scope.arg(), "-n", &n.to_string(), "--json"])
+        .output()
+        .map(|o| parse_tracks(&o.stdout))
+        .unwrap_or_default()
+}
+
+/// Faixas do mesmo estilo que `id` (rádio do YT Music; a biblioteca vem primeiro).
+fn fetch_similar(id: &str, n: usize) -> Vec<Track> {
+    Command::new(db::ytm_cmd())
+        .args(["similar", id, "-n", &n.to_string(), "--json"])
+        .output()
+        .map(|o| parse_tracks(&o.stdout))
+        .unwrap_or_default()
 }
 
 const BATCH: usize = 30; // tamanho da fila montada ao tocar um cartão
@@ -585,8 +621,14 @@ fn request_more(a: &mut App) {
     }
     a.fetching_more = true;
     let (scope, tx) = (a.scope, a.tx.clone());
+    let seed = a.queue.get(a.idx).map(|t| t.id.clone());
+    let style = a.style;
     std::thread::spawn(move || {
-        let _ = tx.send_blocking(Msg::More(fetch_recs(scope, BATCH)));
+        let tracks = match (style, seed) {
+            (true, Some(id)) => fetch_similar(&id, BATCH),
+            _ => fetch_recs(scope, BATCH),
+        };
+        let _ = tx.send_blocking(Msg::More(tracks));
     });
 }
 
@@ -680,6 +722,30 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
                 request_more(a);
             }
         }
+        Msg::Similar(seed, tracks) => {
+            // só vale se a faixa de partida ainda é a que está tocando
+            if a.queue.get(a.idx).is_some_and(|t| t.id == seed) {
+                a.queue.truncate(a.idx + 1);
+                let have: HashSet<String> = a.queue.iter().map(|t| t.id.clone()).collect();
+                a.queue.extend(tracks.into_iter().filter(|t| !have.contains(&t.id)));
+                if a.now_open {
+                    fill_now(a);
+                }
+            }
+        }
+        Msg::SetStyle(on) => {
+            if a.style != on {
+                a.style = on;
+                if let Some(cur) = a.queue.get(a.idx).map(|t| t.id.clone()) {
+                    a.radio = true; // a fila passa a ser montada automaticamente
+                    let (scope, tx) = (a.scope, a.tx.clone());
+                    std::thread::spawn(move || {
+                        let t = if on { fetch_similar(&cur, BATCH) } else { fetch_recs(scope, BATCH) };
+                        let _ = tx.send_blocking(Msg::Similar(cur, t));
+                    });
+                }
+            }
+        }
         Msg::Volume(v) => {
             a.player.set_volume(v);
             if a.player.muted && v > 0.0 {
@@ -713,10 +779,20 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
         }
         Msg::PlayCard(i) => {
             if let Some(first) = a.recs.get(i).cloned() {
-                let mut q = vec![first];
-                q.extend(a.recs.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, t)| t.clone()));
                 a.radio = true;
-                start_queue(a, q, 0);
+                if a.style {
+                    // toca já; a fila do mesmo estilo chega em ~1-2 s
+                    let (seed, tx) = (first.id.clone(), a.tx.clone());
+                    start_queue(a, vec![first], 0);
+                    std::thread::spawn(move || {
+                        let t = fetch_similar(&seed, BATCH);
+                        let _ = tx.send_blocking(Msg::Similar(seed, t));
+                    });
+                } else {
+                    let mut q = vec![first];
+                    q.extend(a.recs.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, t)| t.clone()));
+                    start_queue(a, q, 0);
+                }
             }
         }
         Msg::More(tracks) => {
@@ -1053,6 +1129,7 @@ fn build_ui(gapp: &gtk::Application) {
         radio: false,
         fetching_more: false,
         now_open: false,
+        style: true,
     }));
     {
         let mut a = st.borrow_mut();

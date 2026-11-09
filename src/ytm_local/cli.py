@@ -12,6 +12,7 @@ from ytmusicapi import YTMusic, setup
 from .db import connect
 from .discover import discover
 from .recommend import recommend_now
+from .similar import similar as similar_tracks
 from .download import download_pending, estimate_bytes, pending_rows
 from .sync import sync
 
@@ -154,6 +155,18 @@ def cmd_discover(args) -> None:
         print(f"{min(args.add, len(top))} adicionadas à fila de download (rode: ytm-local download).")
 
 
+def cmd_similar(args) -> None:
+    if not AUTH_FILE.exists():
+        raise SystemExit("Sem autenticação. Rode: ytm-local auth --from-browser firefox")
+    tracks = similar_tracks(connect(DB_FILE), YTMusic(str(AUTH_FILE)), args.id, args.n, args.library_only)
+    if args.json:
+        print(json.dumps(tracks, ensure_ascii=False))
+        return
+    for i, t in enumerate(tracks, 1):
+        where = "disco" if t["local"] else ("biblioteca" if t["known"] else "novo")
+        print(f"{i:2}. {t['artists']} - {t['title']}  [{where}]")
+
+
 def cmd_status(args) -> None:
     conn = connect(DB_FILE)
     for r in conn.execute("SELECT status, COUNT(*) n FROM tracks GROUP BY status"):
@@ -211,6 +224,13 @@ def main() -> None:
     dv.add_argument("--new-artists", action="store_true", help="só artistas que você ainda não tem")
     dv.add_argument("--add", type=int, metavar="N", help="coloca as N primeiras na fila de download")
     dv.set_defaults(fn=cmd_discover)
+
+    sm = sub.add_parser("similar", help="faixas do mesmo estilo (rádio do YT Music) a partir de uma faixa")
+    sm.add_argument("id", help="video_id da faixa de partida")
+    sm.add_argument("-n", type=int, default=30)
+    sm.add_argument("--library-only", action="store_true", help="só o que já está na sua biblioteca")
+    sm.add_argument("--json", action="store_true", help="saída para o app")
+    sm.set_defaults(fn=cmd_similar)
 
     st = sub.add_parser("status", help="resumo do estado")
     st.add_argument("--bitrate", type=int, default=256, help="kbps usado na estimativa de tamanho")
