@@ -56,6 +56,7 @@ cd toca && cargo build --release
 
 - **Ouvir agora**: 5 sugestões do `ytm-local recommend --scope all --json`. O seletor Tudo / No disco / Na nuvem filtra.
 - **No disco** toca o arquivo local. **Na nuvem** toca por streaming (mpv + yt-dlp, com os cookies do Firefox) e tem o botão **Baixar** (`ytm-local download --id`).
+- **Busca**: o campo no topo filtra a biblioteca enquanto você digita (sem acento, por começo de palavra; `Ctrl+F` foca). `Enter` também procura no YouTube Music (`ytm-local search`); o que ainda não está na biblioteca aparece com a etiqueta Nova e só toca por streaming.
 - **Mesmo estilo** (padrão): ao tocar um cartão, a fila é a rádio do YouTube Music daquela faixa (`ytm-local similar`), com o que já está na sua biblioteca na frente. O YT Music não expõe gênero por faixa, então "estilo" é a recomendação dele. O botão fica em Agora tocando e dá para desligar.
 - **Capas**: não vão para o disco. São buscadas só quando há internet, ficam em memória (até ~300) e, sem rede, aparece um bloco neutro.
 - **RAM**: renderizador por software (`GSK_RENDERER=cairo`, use `TOCA_GPU=1` para o padrão do GTK), listas virtualizadas, um processo `mpv` por faixa que só existe enquanto toca, interface orientada a eventos (sem polling). Medido: ~40 MB de memória própria.

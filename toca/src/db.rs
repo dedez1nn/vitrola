@@ -11,6 +11,7 @@ pub struct Track {
     pub local: bool,
     pub path: Option<String>,
     pub thumb: Option<String>,
+    pub online: bool, // resultado do YouTube Music que ainda não está na biblioteca
 }
 
 fn home() -> PathBuf {
@@ -52,6 +53,7 @@ pub fn tracks(conn: &Connection, local: bool) -> Vec<Track> {
             local,
             path: if local { r.get(3)? } else { None },
             thumb: r.get(4)?,
+            online: false,
         })
     })
     .map(|rows| rows.flatten().collect())

@@ -24,6 +24,33 @@ def _seconds(length: str | None) -> int | None:
         return None
 
 
+def annotate(conn: sqlite3.Connection, cands: list[dict]) -> list[dict]:
+    """Junta cada candidato (video_id, title, artists, thumbnail) com o que há no banco local."""
+    marks = ",".join("?" * len(cands)) or "''"
+    owned = {
+        r["video_id"]: r
+        for r in conn.execute(
+            f"SELECT video_id, status, path, thumbnail FROM tracks WHERE video_id IN ({marks})",
+            [c["video_id"] for c in cands],
+        )
+    }
+    out, seen = [], set()
+    for c in cands:
+        if c["video_id"] in seen:
+            continue
+        seen.add(c["video_id"])
+        row = owned.get(c["video_id"])
+        local = bool(row and row["status"] == "done" and row["path"])
+        out.append({
+            **c,
+            "local": local,
+            "path": row["path"] if local else None,
+            "thumbnail": (row["thumbnail"] if row and row["thumbnail"] else c["thumbnail"]),
+            "known": row is not None,
+        })
+    return out
+
+
 def similar(conn: sqlite3.Connection, yt: YTMusic, video_id: str, n: int = 30, library_only: bool = False) -> list[dict]:
     raw = yt.get_watch_playlist(videoId=video_id, radio=True, limit=max(n * 2, 50))["tracks"]
 
@@ -41,29 +68,7 @@ def similar(conn: sqlite3.Connection, yt: YTMusic, video_id: str, n: int = 30, l
             "thumbnail": thumbs[-1].get("url") if thumbs else None,
         })
 
-    marks = ",".join("?" * len(cands)) or "''"
-    owned = {
-        r["video_id"]: r
-        for r in conn.execute(
-            f"SELECT video_id, status, path, thumbnail FROM tracks WHERE video_id IN ({marks})",
-            [c["video_id"] for c in cands],
-        )
-    }
-    out = []
-    seen = set()
-    for c in cands:
-        if c["video_id"] in seen:
-            continue
-        seen.add(c["video_id"])
-        row = owned.get(c["video_id"])
-        local = bool(row and row["status"] == "done" and row["path"])
-        out.append({
-            **c,
-            "local": local,
-            "path": row["path"] if local else None,
-            "thumbnail": (row["thumbnail"] if row and row["thumbnail"] else c["thumbnail"]),
-            "known": row is not None,
-        })
+    out = annotate(conn, cands)
     if library_only:
         out = [o for o in out if o["known"]]
     out.sort(key=lambda o: not o["known"])  # estável: biblioteca primeiro, ordem da rádio dentro de cada grupo

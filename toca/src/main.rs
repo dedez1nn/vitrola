@@ -5,6 +5,7 @@
 mod covers;
 mod db;
 mod player;
+mod search;
 
 use async_channel::Sender;
 use db::Track;
@@ -57,6 +58,10 @@ enum Msg {
     ToggleMute,
     Similar(String, Vec<Track>),
     SetStyle(bool),
+    Search(String),
+    SearchOnline,
+    Online(String, Vec<Track>),
+    PlayResult(u32),
 }
 
 type Tx = Sender<Msg>;
@@ -112,6 +117,10 @@ listview > row:hover { background: #1D212A; }
 .qrow.current .ctitle { color: #4ADE9C; }
 .rm { background: transparent; border: none; box-shadow: none; color: #A3ACB8; min-width: 32px; min-height: 32px; padding: 0; border-radius: 999px; }
 .rm:hover { background: #2A2F3A; color: #ECEEF1; }
+.searchbar { padding: 16px 28px 0 28px; }
+searchentry.search { background: #161920; color: #ECEEF1; border: 1px solid #2A2F3A; border-radius: 10px; min-height: 38px; box-shadow: none; padding: 0 10px; }
+searchentry.search:focus-within { border-color: #4ADE9C; }
+.badge-new { background: #2B2410; color: #F5C451; border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600; }
 .chip { background: transparent; border: 1px solid #2A2F3A; color: #A3ACB8; border-radius: 999px; padding: 0 14px; min-height: 30px; box-shadow: none; }
 .chip:checked { background: #12281F; border-color: #4ADE9C; color: #4ADE9C; }
 .current { background: #1D212A; border-radius: 8px; }
@@ -156,6 +165,13 @@ struct NowW {
     lv: gtk::ListView,
 }
 
+struct ResultsW {
+    root: gtk::Box,
+    store: gio::ListStore,
+    header: gtk::Label,
+    online: gtk::Button,
+}
+
 struct Ui {
     cards: Vec<CardW>,
     local_store: gio::ListStore,
@@ -163,6 +179,7 @@ struct Ui {
     local_shelf: gtk::Box,
     cloud_shelf: gtk::Box,
     now: NowW,
+    results: ResultsW,
     stack: gtk::Stack,
     bar: Bar,
     progress: gtk::ProgressBar,
@@ -183,6 +200,9 @@ struct App {
     radio: bool,
     fetching_more: bool,
     now_open: bool,
+    index: Vec<search::Entry>,
+    search_q: String,
+    results: Vec<Track>,
     style: bool, // fila por estilo (rádio da faixa) em vez de sugestões gerais
 }
 
@@ -227,6 +247,7 @@ fn cover_pic(w: i32, h: i32) -> gtk::Picture {
 fn set_badge(l: &gtk::Label, local: bool, long: bool) {
     l.remove_css_class("badge-local");
     l.remove_css_class("badge-cloud");
+    l.remove_css_class("badge-new");
     l.add_css_class(if local { "badge-local" } else { "badge-cloud" });
     l.set_text(match (local, long) {
         (true, false) => "Local",
@@ -234,6 +255,13 @@ fn set_badge(l: &gtk::Label, local: bool, long: bool) {
         (true, true) => "Tocando do disco",
         (false, true) => "Tocando da nuvem",
     });
+}
+
+fn set_badge_new(l: &gtk::Label) {
+    l.remove_css_class("badge-local");
+    l.remove_css_class("badge-cloud");
+    l.add_css_class("badge-new");
+    l.set_text("Nova");
 }
 
 fn make_card(tx: &Tx, i: usize) -> CardW {
@@ -543,13 +571,131 @@ fn fill_now(a: &App) {
 
 /// Mostra ou esconde a página; ao esconder, libera a lista e a capa grande da memória.
 fn show_now(a: &mut App) {
-    a.ui.stack.set_visible_child_name(if a.now_open { "now" } else { "home" });
+    let back = if a.search_q.trim().is_empty() { "home" } else { "search" };
+    a.ui.stack.set_visible_child_name(if a.now_open { "now" } else { back });
     if a.now_open {
         fill_now(a);
     } else {
         a.ui.now.store.remove_all();
         a.ui.now.pic.set_paintable(gtk::gdk::Paintable::NONE);
     }
+}
+
+fn make_results_page(tx: &Tx) -> ResultsW {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    root.set_margin_top(18);
+    root.set_margin_bottom(16);
+    root.set_margin_start(28);
+    root.set_margin_end(28);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let header = label("", "dim");
+    header.set_hexpand(true);
+    let online = gtk::Button::with_label("Procurar no YouTube Music");
+    online.add_css_class("dl");
+    online.connect_clicked({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send_blocking(Msg::SearchOnline);
+        }
+    });
+    head.append(&header);
+    head.append(&online);
+    root.append(&head);
+
+    let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup({
+        let tx = tx.clone();
+        move |_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            row.append(&cover_pic(40, 40));
+            let col = gtk::Box::new(gtk::Orientation::Vertical, 1);
+            col.set_hexpand(true);
+            col.set_valign(gtk::Align::Center);
+            col.append(&label("", ""));
+            col.append(&label("", "dim"));
+            row.append(&col);
+            let badge = label("", "");
+            badge.set_valign(gtk::Align::Center);
+            row.append(&badge);
+            let b = gtk::Button::with_label("Baixar");
+            b.add_css_class("dl");
+            b.set_valign(gtk::Align::Center);
+            let tx = tx.clone();
+            b.connect_clicked(move |b| {
+                let _ = tx.send_blocking(Msg::Download(b.widget_name().to_string()));
+            });
+            row.append(&b);
+            item.set_child(Some(&row));
+        }
+    });
+    factory.connect_bind(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        let Some(obj) = item.item().and_downcast::<glib::BoxedAnyObject>() else { return };
+        let t = obj.borrow::<Track>();
+        let row = item.child().and_downcast::<gtk::Box>().unwrap();
+        let pic = row.first_child().and_downcast::<gtk::Picture>().unwrap();
+        let col = pic.next_sibling().and_downcast::<gtk::Box>().unwrap();
+        let badge = col.next_sibling().and_downcast::<gtk::Label>().unwrap();
+        let btn = badge.next_sibling().and_downcast::<gtk::Button>().unwrap();
+        let title = col.first_child().and_downcast::<gtk::Label>().unwrap();
+        let artist = title.next_sibling().and_downcast::<gtk::Label>().unwrap();
+        title.set_text(&t.title);
+        artist.set_text(&t.artists);
+        if t.online {
+            set_badge_new(&badge);
+        } else {
+            set_badge(&badge, t.local, false);
+        }
+        covers::apply(&pic, &t.id, &t.thumb, 80);
+        btn.set_widget_name(&t.id);
+        btn.set_visible(!t.local && !t.online); // só dá para baixar o que já está na biblioteca
+        let busy = DOWNLOADING.with(|d| d.borrow().contains(&t.id));
+        btn.set_sensitive(!busy);
+        btn.set_label(if busy { "Baixando…" } else { "Baixar" });
+    });
+    let lv = gtk::ListView::new(Some(gtk::NoSelection::new(Some(store.clone()))), Some(factory));
+    lv.set_single_click_activate(true);
+    lv.connect_activate({
+        let tx = tx.clone();
+        move |_, pos| {
+            let _ = tx.send_blocking(Msg::PlayResult(pos));
+        }
+    });
+    let sw = gtk::ScrolledWindow::new();
+    sw.set_child(Some(&lv));
+    sw.set_vexpand(true);
+    sw.set_hscrollbar_policy(gtk::PolicyType::Never);
+    root.append(&sw);
+    ResultsW { root, store, header, online }
+}
+
+fn rebuild_index(a: &mut App) {
+    let mut all = db::tracks(&a.conn, true);
+    all.extend(db::tracks(&a.conn, false));
+    a.index = search::build(all);
+}
+
+fn update_results(a: &App) {
+    let lib = a.results.iter().filter(|t| !t.online).count();
+    let on = a.results.len() - lib;
+    let r = &a.ui.results;
+    fill(&r.store, a.results.clone());
+    r.header.set_text(&match (lib, on) {
+        (0, 0) => format!("Nada encontrado para \"{}\"", a.search_q.trim()),
+        (l, 0) => format!("{l} na sua biblioteca"),
+        (l, o) => format!("{l} na biblioteca, {o} no YouTube Music"),
+    });
+    r.online.set_visible(on == 0);
+}
+
+fn run_search(a: &mut App) {
+    a.results = search::query(&a.index, &a.search_q, 200);
+    update_results(a);
 }
 
 fn fill(store: &gio::ListStore, tracks: Vec<Track>) {
@@ -580,6 +726,7 @@ fn parse_tracks(stdout: &[u8]) -> Vec<Track> {
                 local: v["local"].as_bool().unwrap_or(false),
                 path: s("path"),
                 thumb: s("thumbnail"),
+                online: v["known"].as_bool() == Some(false),
             });
         }
     }
@@ -722,6 +869,52 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
                 request_more(a);
             }
         }
+        Msg::Search(q) => {
+            a.search_q = q;
+            if a.search_q.trim().is_empty() {
+                a.results.clear();
+                a.ui.results.store.remove_all();
+                if !a.now_open {
+                    a.ui.stack.set_visible_child_name("home");
+                }
+            } else {
+                if a.now_open {
+                    a.now_open = false;
+                    show_now(a); // libera a página Agora tocando
+                }
+                run_search(a);
+                a.ui.stack.set_visible_child_name("search");
+            }
+        }
+        Msg::SearchOnline => {
+            let q = a.search_q.trim().to_string();
+            if !q.is_empty() {
+                a.ui.results.header.set_text("Buscando no YouTube Music…");
+                let tx = a.tx.clone();
+                std::thread::spawn(move || {
+                    let tracks = Command::new(db::ytm_cmd())
+                        .args(["search", &q, "-n", "20", "--json"])
+                        .output()
+                        .map(|o| parse_tracks(&o.stdout))
+                        .unwrap_or_default();
+                    let _ = tx.send_blocking(Msg::Online(q, tracks));
+                });
+            }
+        }
+        Msg::Online(q, tracks) => {
+            if q == a.search_q.trim() {
+                let have: HashSet<String> = a.results.iter().map(|t| t.id.clone()).collect();
+                a.results.extend(tracks.into_iter().filter(|t| !have.contains(&t.id)));
+                update_results(a);
+            }
+        }
+        Msg::PlayResult(pos) => {
+            let q: Vec<Track> = a.results.iter().skip(pos as usize).take(100).cloned().collect();
+            if !q.is_empty() {
+                a.radio = false;
+                start_queue(a, q, 0);
+            }
+        }
         Msg::Similar(seed, tracks) => {
             // só vale se a faixa de partida ainda é a que está tocando
             if a.queue.get(a.idx).is_some_and(|t| t.id == seed) {
@@ -833,6 +1026,10 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
         Msg::Downloaded(id, _ok) => {
             DOWNLOADING.with(|d| d.borrow_mut().remove(&id));
             refresh_lists(a);
+            rebuild_index(a);
+            if !a.search_q.trim().is_empty() {
+                run_search(a);
+            }
             refresh_progress(a);
         }
         Msg::Next => {
@@ -993,8 +1190,36 @@ fn build_ui(gapp: &gtk::Application) {
     stack.set_transition_duration(120);
     stack.add_named(&main, Some("home"));
     stack.add_named(&now.root, Some("now"));
+    let results = make_results_page(&tx);
+    stack.add_named(&results.root, Some("search"));
+    stack.set_vexpand(true);
+    let search_entry = gtk::SearchEntry::new();
+    search_entry.add_css_class("search");
+    search_entry.set_placeholder_text(Some("Buscar música ou artista (Enter procura no YouTube Music)"));
+    search_entry.set_width_request(460);
+    search_entry.set_halign(gtk::Align::Start);
+    search_entry.connect_search_changed({
+        let tx = tx.clone();
+        move |e| {
+            let _ = tx.send_blocking(Msg::Search(e.text().to_string()));
+        }
+    });
+    search_entry.connect_activate({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send_blocking(Msg::SearchOnline);
+        }
+    });
+    search_entry.connect_stop_search(|e| e.set_text("")); // Esc limpa a busca
+    let searchbar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    searchbar.add_css_class("searchbar");
+    searchbar.append(&search_entry);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.set_hexpand(true);
+    content.append(&searchbar);
+    content.append(&stack);
     top.append(&side);
-    top.append(&stack);
+    top.append(&content);
 
     // ---------- player ----------
     let player_bar = gtk::Box::new(gtk::Orientation::Horizontal, 16);
@@ -1109,6 +1334,7 @@ fn build_ui(gapp: &gtk::Application) {
             local_shelf,
             cloud_shelf,
             now,
+            results,
             stack,
             bar: Bar { pic: bpic, title: btitle, artist: bartist, badge: bbadge, play, scale, cur, total, mute: mute_btn },
             progress,
@@ -1129,11 +1355,15 @@ fn build_ui(gapp: &gtk::Application) {
         radio: false,
         fetching_more: false,
         now_open: false,
+        index: vec![],
+        search_q: String::new(),
+        results: vec![],
         style: true,
     }));
     {
         let mut a = st.borrow_mut();
         refresh_lists(&a);
+        rebuild_index(&mut a);
         refresh_progress(&a);
         request_recs(&mut a);
     }
@@ -1183,9 +1413,13 @@ fn build_ui(gapp: &gtk::Application) {
     let keys = gtk::EventControllerKey::new();
     keys.connect_key_pressed({
         let tx = tx.clone();
-        move |_, key, _, _| {
+        let entry = search_entry.clone();
+        move |_, key, _, state| {
             if key == gtk::gdk::Key::Escape {
                 let _ = tx.send_blocking(Msg::CloseNow);
+            }
+            if key == gtk::gdk::Key::f && state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+                entry.grab_focus();
             }
             glib::Propagation::Proceed
         }
