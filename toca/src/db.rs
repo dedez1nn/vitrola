@@ -67,3 +67,27 @@ pub fn counts(conn: &Connection) -> (i64, i64) {
 pub fn record_play(conn: &Connection, id: &str) {
     let _ = conn.execute("INSERT INTO plays (video_id) VALUES (?)", [id]);
 }
+
+fn volume_file() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".config"))
+        .join("toca")
+        .join("volume")
+}
+
+/// Volume salvo (0..=100); 100 se ainda não houver.
+pub fn load_volume() -> f64 {
+    std::fs::read_to_string(volume_file())
+        .ok()
+        .and_then(|t| t.trim().parse::<f64>().ok())
+        .map_or(100.0, |v| v.clamp(0.0, 100.0))
+}
+
+pub fn save_volume(v: f64) {
+    let f = volume_file();
+    if let Some(dir) = f.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(f, format!("{}\n", v.round() as i64));
+}

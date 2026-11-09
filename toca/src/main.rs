@@ -53,6 +53,8 @@ enum Msg {
     RemoveAt(u32),
     SetRadio(bool),
     ClearUpcoming,
+    Volume(f64),
+    ToggleMute,
 }
 
 type Tx = Sender<Msg>;
@@ -134,6 +136,7 @@ struct Bar {
     scale: gtk::Scale,
     cur: gtk::Label,
     total: gtk::Label,
+    mute: gtk::Button,
 }
 
 /// Página "Agora tocando": capa grande e a fila completa (como o Now Playing do ytfast).
@@ -176,6 +179,18 @@ struct App {
     radio: bool,
     fetching_more: bool,
     now_open: bool,
+}
+
+fn vol_icon(v: f64, muted: bool) -> &'static str {
+    if muted || v < 1.0 {
+        "audio-volume-muted-symbolic"
+    } else if v < 34.0 {
+        "audio-volume-low-symbolic"
+    } else if v < 67.0 {
+        "audio-volume-medium-symbolic"
+    } else {
+        "audio-volume-high-symbolic"
+    }
 }
 
 fn fmt_time(s: f64) -> String {
@@ -665,6 +680,18 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
                 request_more(a);
             }
         }
+        Msg::Volume(v) => {
+            a.player.set_volume(v);
+            if a.player.muted && v > 0.0 {
+                a.player.toggle_mute(); // mexer no slider tira do mudo
+            }
+            a.ui.bar.mute.set_icon_name(vol_icon(a.player.volume, a.player.muted));
+            db::save_volume(a.player.volume);
+        }
+        Msg::ToggleMute => {
+            a.player.toggle_mute();
+            a.ui.bar.mute.set_icon_name(vol_icon(a.player.volume, a.player.muted));
+        }
         Msg::ClearUpcoming => {
             a.queue.truncate(a.idx + 1);
             if a.now_open {
@@ -944,7 +971,30 @@ fn build_ui(gapp: &gtk::Application) {
             glib::Propagation::Proceed
         }
     });
-    for w in [bpic.upcast_ref::<gtk::Widget>(), qbtn.upcast_ref(), bbadge.upcast_ref(), prev.upcast_ref(), play.upcast_ref(), next.upcast_ref(), cur.upcast_ref(), scale.upcast_ref(), total.upcast_ref()] {
+    let vol0 = db::load_volume();
+    let mute_btn = gtk::Button::from_icon_name(vol_icon(vol0, false));
+    mute_btn.add_css_class("pbtn");
+    mute_btn.set_tooltip_text(Some("Mudo"));
+    mute_btn.connect_clicked({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send_blocking(Msg::ToggleMute);
+        }
+    });
+    let vol = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 1.0);
+    vol.set_draw_value(false);
+    vol.set_value(vol0); // antes de ligar o sinal: não dispara a mensagem
+    vol.set_size_request(110, -1);
+    vol.set_valign(gtk::Align::Center);
+    vol.set_tooltip_text(Some("Volume do Toca"));
+    vol.connect_change_value({
+        let tx = tx.clone();
+        move |_, _, v| {
+            let _ = tx.send_blocking(Msg::Volume(v.clamp(0.0, 100.0)));
+            glib::Propagation::Proceed
+        }
+    });
+    for w in [bpic.upcast_ref::<gtk::Widget>(), qbtn.upcast_ref(), bbadge.upcast_ref(), prev.upcast_ref(), play.upcast_ref(), next.upcast_ref(), cur.upcast_ref(), scale.upcast_ref(), total.upcast_ref(), mute_btn.upcast_ref(), vol.upcast_ref()] {
         player_bar.append(w);
     }
 
@@ -984,13 +1034,17 @@ fn build_ui(gapp: &gtk::Application) {
             cloud_shelf,
             now,
             stack,
-            bar: Bar { pic: bpic, title: btitle, artist: bartist, badge: bbadge, play, scale, cur, total },
+            bar: Bar { pic: bpic, title: btitle, artist: bartist, badge: bbadge, play, scale, cur, total, mute: mute_btn },
             progress,
             progress_label,
         },
         tx: tx.clone(),
         emit,
-        player: Player::new(),
+        player: {
+            let mut p = Player::new();
+            p.volume = vol0;
+            p
+        },
         queue: vec![],
         idx: 0,
         recs: vec![],
@@ -1075,7 +1129,9 @@ fn main() -> glib::ExitCode {
     if std::env::var_os("GSK_RENDERER").is_none() && std::env::var_os("TOCA_GPU").is_none() {
         unsafe { std::env::set_var("GSK_RENDERER", "cairo") };
     }
-    let app = gtk::Application::builder().application_id("dev.toca.player").build();
+    // TOCA_APP_ID permite uma segunda instância isolada (testes); o normal é uma só
+    let id = std::env::var("TOCA_APP_ID").unwrap_or_else(|_| "dev.toca.player".into());
+    let app = gtk::Application::builder().application_id(id).build();
     app.connect_activate(build_ui);
     app.run()
 }

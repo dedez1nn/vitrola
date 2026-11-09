@@ -27,6 +27,8 @@ pub struct Player {
     sock: std::path::PathBuf,
     writer: Arc<Mutex<Option<UnixStream>>>,
     generation: Arc<AtomicU64>,
+    pub volume: f64, // 0..=100, vale para as próximas faixas também
+    pub muted: bool,
 }
 
 impl Player {
@@ -48,6 +50,8 @@ impl Player {
         let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
         Self::clean_stale_sockets(&dir);
         Player {
+            volume: 100.0,
+            muted: false,
             child: None,
             sock: dir.join(format!("toca-mpv-{}.sock", std::process::id())),
             writer: Arc::new(Mutex::new(None)),
@@ -77,7 +81,9 @@ impl Player {
             "--no-video", "--no-terminal", "--no-config", "--really-quiet", "--audio-display=no",
             "--cache-secs=30", "--demuxer-max-bytes=8MiB", "--demuxer-max-back-bytes=1MiB",
         ])
-        .arg(format!("--input-ipc-server={}", self.sock.display()));
+        .arg(format!("--input-ipc-server={}", self.sock.display()))
+        .arg(format!("--volume={}", self.volume))
+        .arg(if self.muted { "--mute=yes" } else { "--mute=no" });
         let target = match (&t.path, t.local) {
             (Some(p), true) => p.clone(),
             _ => {
@@ -168,6 +174,16 @@ impl Player {
         if let Some(w) = self.writer.lock().unwrap().as_mut() {
             let _ = writeln!(w, "{json}");
         }
+    }
+
+    pub fn set_volume(&mut self, v: f64) {
+        self.volume = v.clamp(0.0, 100.0);
+        self.send(&format!(r#"{{"command":["set_property","volume",{}]}}"#, self.volume));
+    }
+
+    pub fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        self.send(&format!(r#"{{"command":["set_property","mute",{}]}}"#, self.muted));
     }
 
     pub fn toggle_pause(&self) {
