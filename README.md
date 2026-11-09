@@ -5,7 +5,8 @@ Backup local da sua biblioteca do YouTube Music, só áudio (m4a original, sem r
 ## Fluxo
 
 ```bash
-uv run ytm-local auth                 # cola os headers do music.youtube.com (uma vez)
+uv run ytm-local auth --from-browser firefox   # lê os cookies do Firefox (você precisa estar logado no music.youtube.com)
+# alternativa manual: uv run ytm-local auth (cola os headers)
 uv run ytm-local sync                 # curtidas, biblioteca, playlists e histórico -> SQLite
 uv run ytm-local status
 uv run ytm-local download --limit 5 --cookies-browser firefox   # teste pequeno

@@ -21,8 +21,34 @@ def _fmt(n: float) -> str:
     return f"{n / 1e9:.2f} GB" if n >= 1e9 else f"{n / 1e6:.1f} MB"
 
 
+def _headers_from_browser(browser: str) -> str:
+    """Monta os headers que o ytmusicapi espera a partir dos cookies do navegador."""
+    from yt_dlp.cookies import extract_cookies_from_browser
+
+    jar = extract_cookies_from_browser(browser)
+    # só youtube.com: os cookies de login existem também em .google.com com valores diferentes
+    cookies = {c.name: c.value for c in jar if c.domain.lstrip(".").endswith("youtube.com")}
+    if "SAPISID" not in cookies and "__Secure-3PAPISID" not in cookies:
+        raise SystemExit(f"Sem login do Google no {browser}. Entre em music.youtube.com e tente de novo.")
+    cookie = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    return "\n".join([
+        "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+        "Accept: */*",
+        "Content-Type: application/json",
+        "Authorization: SAPISIDHASH placeholder",  # recalculado pelo ytmusicapi a partir do cookie
+        "X-Goog-AuthUser: 0",
+        "x-origin: https://music.youtube.com",
+        f"Cookie: {cookie}",
+    ])
+
+
 def cmd_auth(args) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if args.from_browser:
+        setup(filepath=str(AUTH_FILE), headers_raw=_headers_from_browser(args.from_browser))
+        AUTH_FILE.chmod(0o600)
+        print(f"Autenticação gerada a partir do {args.from_browser} em {AUTH_FILE}")
+        return
     print(
         "No music.youtube.com logado: DevTools > Network > filtre por 'browse' > clique numa\n"
         "requisição POST > botão direito > Copy > Copy request headers. Cole abaixo e finalize\n"
@@ -81,7 +107,10 @@ def main() -> None:
     p = argparse.ArgumentParser(prog="ytm-local", description="Backup local do YouTube Music (só áudio)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("auth", help="configura a autenticação do YouTube Music").set_defaults(fn=cmd_auth)
+    a = sub.add_parser("auth", help="configura a autenticação do YouTube Music")
+    a.add_argument("--from-browser", metavar="NAVEGADOR",
+                   help="lê os cookies do navegador (ex.: firefox) em vez de colar headers")
+    a.set_defaults(fn=cmd_auth)
 
     s = sub.add_parser("sync", help="lista as músicas da conta e grava no banco local")
     s.add_argument("sources", nargs="*", default=["all"],
