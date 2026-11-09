@@ -3,6 +3,7 @@
 use crate::db::Track;
 use std::{
     fs,
+    os::unix::process::CommandExt,
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     process::{Child, Command, Stdio},
@@ -70,6 +71,13 @@ impl Player {
             }
         };
         cmd.arg(target).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        // o kernel mata o mpv se o Toca morrer por qualquer motivo (SIGKILL, crash, pkill)
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
         match cmd.spawn() {
             Ok(c) => self.child = Some(c),
             Err(_) => {

@@ -46,6 +46,7 @@ enum Msg {
     Pause,
     Seek(f64),
     SetScope(Scope),
+    Quit,
 }
 
 type Tx = Sender<Msg>;
@@ -395,6 +396,12 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
             }
         }
         Msg::Cover(id, res) => covers::deliver(id, res),
+        Msg::Quit => {
+            a.player.stop();
+            if let Some(app) = gio::Application::default() {
+                app.quit();
+            }
+        }
         Msg::Tick => refresh_progress(a),
         Msg::SetScope(s) => {
             a.scope = s;
@@ -731,6 +738,19 @@ fn build_ui(gapp: &gtk::Application) {
             glib::ControlFlow::Continue
         }
     });
+    // fechar por sinal (kill, logout, Ctrl+C) também para o áudio e encerra o app
+    if let Ok(mut signals) = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGHUP,
+    ]) {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            if signals.forever().next().is_some() {
+                let _ = tx.send_blocking(Msg::Quit);
+            }
+        });
+    }
     win.connect_close_request({
         let st = st.clone();
         move |_| {
