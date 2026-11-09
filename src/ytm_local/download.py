@@ -18,9 +18,12 @@ def _safe(name: str) -> str:
 def build_opts(out_dir: Path, cookies_browser: str | None, cookies_file: Path | None) -> dict:
     opts = {
         "format": FORMAT,
-        "outtmpl": str(out_dir / "%(artist,uploader|Desconhecido)s" / "%(title)s [%(id)s].%(ext)s"),
+        # `.80s`/`.120s` truncam: listas enormes de artistas estouravam o limite de 255 bytes do nome
+        "outtmpl": str(out_dir / "%(artist,uploader|Desconhecido).80s" / "%(title).120s [%(id)s].%(ext)s"),
         "writethumbnail": True,
         "postprocessors": [
+            # capas webp/outros formatos quebravam o EmbedThumbnail: converte para jpg antes
+            {"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"},
             {"key": "FFmpegMetadata", "add_metadata": True},
             {"key": "EmbedThumbnail"},
         ],
