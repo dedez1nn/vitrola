@@ -40,8 +40,15 @@ def build_opts(out_dir: Path, cookies_browser: str | None, cookies_file: Path | 
 DEFAULT_SECONDS = 210  # duração assumida quando a faixa não informa
 
 
+MAX_SECONDS = 20 * 60  # shows/DVDs inteiros nas curtidas não são "músicas"; use --max-minutes 0 para incluir
+
+
 def pending_rows(
-    conn: sqlite3.Connection, limit: int | None, retry_failed: bool, ids: list[str] | None = None
+    conn: sqlite3.Connection,
+    limit: int | None,
+    retry_failed: bool,
+    ids: list[str] | None = None,
+    max_seconds: int | None = MAX_SECONDS,
 ) -> list[sqlite3.Row]:
     if ids:  # download explícito por ID, ignora o status
         marks = ",".join("?" * len(ids))
@@ -50,10 +57,15 @@ def pending_rows(
         ).fetchall()
     statuses = ("pending", "failed") if retry_failed else ("pending",)
     marks = ",".join("?" * len(statuses))
-    sql = f"SELECT video_id, title, artists, duration FROM tracks WHERE status IN ({marks}) ORDER BY added_at"
+    sql = f"SELECT video_id, title, artists, duration FROM tracks WHERE status IN ({marks})"
+    params: list = list(statuses)
+    if max_seconds:
+        sql += " AND (duration IS NULL OR duration <= ?)"
+        params.append(max_seconds)
+    sql += " ORDER BY added_at"
     if limit:
         sql += f" LIMIT {int(limit)}"
-    return conn.execute(sql, statuses).fetchall()
+    return conn.execute(sql, params).fetchall()
 
 
 def estimate_bytes(rows: list[sqlite3.Row], kbps: int) -> int:

@@ -85,7 +85,7 @@ def cmd_sync(args) -> None:
 
 def cmd_download(args) -> None:
     conn = connect(DB_FILE)
-    rows = pending_rows(conn, args.limit, args.retry_failed, args.id)
+    rows = pending_rows(conn, args.limit, args.retry_failed, args.id, args.max_minutes * 60)
     if not rows:
         print("Nada pendente.")
         return
@@ -189,6 +189,8 @@ def main() -> None:
     d.add_argument("--retry-failed", action="store_true")
     d.add_argument("--bitrate", type=int, default=256,
                    help="kbps usado na estimativa de tamanho (256 com Premium, ~128 sem)")
+    d.add_argument("--max-minutes", type=int, default=20,
+                   help="ignora faixas mais longas que isso (shows/DVDs); 0 = sem limite")
     d.add_argument("--id", action="append", help="baixa só este video_id (repetível)")
     d.add_argument("-y", "--yes", action="store_true", help="não pedir confirmação")
     d.set_defaults(fn=cmd_download)
