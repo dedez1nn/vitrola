@@ -126,7 +126,7 @@ def main() -> None:
     s.add_argument("sources", nargs="*", default=["all"],
                    choices=["all", "liked", "library", "history", "playlists"])
     s.add_argument("--limit", type=int, default=5000, help="máx. de faixas por fonte")
-    s.add_argument("--bitrate", type=int, default=128, help="kbps usado na estimativa de tamanho")
+    s.add_argument("--bitrate", type=int, default=256, help="kbps usado na estimativa de tamanho")
     s.set_defaults(fn=cmd_sync)
 
     d = sub.add_parser("download", help="baixa as faixas pendentes")
@@ -136,13 +136,13 @@ def main() -> None:
     d.add_argument("--sleep", type=float, default=2.0, help="pausa entre downloads (s)")
     d.add_argument("--limit", type=int, help="baixa só N faixas (bom para testar)")
     d.add_argument("--retry-failed", action="store_true")
-    d.add_argument("--bitrate", type=int, default=128,
-                   help="kbps usado na estimativa de tamanho (128 sem Premium, ~256 com)")
+    d.add_argument("--bitrate", type=int, default=256,
+                   help="kbps usado na estimativa de tamanho (256 com Premium, ~128 sem)")
     d.add_argument("-y", "--yes", action="store_true", help="não pedir confirmação")
     d.set_defaults(fn=cmd_download)
 
     st = sub.add_parser("status", help="resumo do estado")
-    st.add_argument("--bitrate", type=int, default=128, help="kbps usado na estimativa de tamanho")
+    st.add_argument("--bitrate", type=int, default=256, help="kbps usado na estimativa de tamanho")
     st.set_defaults(fn=cmd_status)
 
     args = p.parse_args()
