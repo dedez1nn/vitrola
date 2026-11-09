@@ -47,6 +47,9 @@ enum Msg {
     Seek(f64),
     SetScope(Scope),
     Quit,
+    QueueOpen,
+    QueueClosed,
+    JumpTo(u32),
 }
 
 type Tx = Sender<Msg>;
@@ -91,6 +94,10 @@ listview > row:hover { background: #1D212A; }
 .player { background: #161920; border-top: 1px solid #2A2F3A; padding: 8px 20px; }
 .pbtn { background: transparent; border: none; box-shadow: none; color: #ECEEF1; }
 .pbtn.main { background: #4ADE9C; color: #07110C; border-radius: 999px; min-width: 40px; min-height: 40px; }
+.qbtn { background: transparent; border: none; box-shadow: none; padding: 4px 8px; border-radius: 8px; }
+.qbtn:hover { background: #1D212A; }
+popover.queue > contents { background: #161920; border: 1px solid #2A2F3A; border-radius: 12px; padding: 12px; color: #ECEEF1; }
+.current { background: #1D212A; border-radius: 8px; }
 progressbar trough { background: #2A2F3A; min-height: 6px; }
 progressbar progress { background: #4ADE9C; min-height: 6px; }
 scale trough { background: #2A2F3A; min-height: 4px; }
@@ -123,6 +130,8 @@ struct Ui {
     cloud_store: gio::ListStore,
     local_shelf: gtk::Box,
     cloud_shelf: gtk::Box,
+    queue_store: gio::ListStore,
+    queue_title: gtk::Label,
     bar: Bar,
     progress: gtk::ProgressBar,
     progress_label: gtk::Label,
@@ -141,6 +150,7 @@ struct App {
     scope: Scope,
     radio: bool,
     fetching_more: bool,
+    queue_open: bool,
 }
 
 fn fmt_time(s: f64) -> String {
@@ -284,6 +294,92 @@ fn make_shelf(title: &str, hint: &str, local: bool, store: &gio::ListStore, tx: 
     shelf
 }
 
+/// Fila de reprodução: só existe com o popover aberto (a lista é esvaziada ao fechar).
+fn make_queue_popover(tx: &Tx) -> (gtk::Popover, gio::ListStore, gtk::Label) {
+    let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        row.set_margin_top(3);
+        row.set_margin_bottom(3);
+        row.set_margin_start(4);
+        row.set_margin_end(4);
+        row.append(&cover_pic(36, 36));
+        let col = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        col.set_hexpand(true);
+        col.set_valign(gtk::Align::Center);
+        col.append(&label("", ""));
+        col.append(&label("", "dim"));
+        row.append(&col);
+        let badge = label("", "");
+        badge.set_valign(gtk::Align::Center);
+        row.append(&badge);
+        item.set_child(Some(&row));
+    });
+    factory.connect_bind(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        let Some(obj) = item.item().and_downcast::<glib::BoxedAnyObject>() else { return };
+        let t = obj.borrow::<Track>();
+        let row = item.child().and_downcast::<gtk::Box>().unwrap();
+        let pic = row.first_child().and_downcast::<gtk::Picture>().unwrap();
+        let col = pic.next_sibling().and_downcast::<gtk::Box>().unwrap();
+        let badge = col.next_sibling().and_downcast::<gtk::Label>().unwrap();
+        let title = col.first_child().and_downcast::<gtk::Label>().unwrap();
+        let artist = title.next_sibling().and_downcast::<gtk::Label>().unwrap();
+        title.set_text(&t.title);
+        artist.set_text(&t.artists);
+        set_badge(&badge, t.local, false);
+        covers::apply(&pic, &t.id, &t.thumb, 72);
+        // posição 0 é a faixa tocando agora
+        row.remove_css_class("current");
+        if item.position() == 0 {
+            row.add_css_class("current");
+        }
+    });
+    let lv = gtk::ListView::new(Some(gtk::NoSelection::new(Some(store.clone()))), Some(factory));
+    lv.set_single_click_activate(true);
+    lv.connect_activate({
+        let tx = tx.clone();
+        move |_, pos| {
+            if pos > 0 {
+                let _ = tx.send_blocking(Msg::JumpTo(pos));
+            }
+        }
+    });
+    let sw = gtk::ScrolledWindow::new();
+    sw.set_child(Some(&lv));
+    sw.set_min_content_width(400);
+    sw.set_min_content_height(380);
+    sw.set_hscrollbar_policy(gtk::PolicyType::Never);
+    let title = label("A seguir", "shelf-title");
+    let col = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    col.append(&title);
+    col.append(&sw);
+    let pop = gtk::Popover::new();
+    pop.set_child(Some(&col));
+    pop.add_css_class("queue");
+    pop.connect_show({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send_blocking(Msg::QueueOpen);
+        }
+    });
+    pop.connect_closed({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send_blocking(Msg::QueueClosed);
+        }
+    });
+    (pop, store, title)
+}
+
+fn fill_queue(a: &App) {
+    let rest: Vec<Track> = a.queue.iter().skip(a.idx).cloned().collect();
+    a.ui.queue_title.set_text(&format!("A seguir ({})", rest.len().saturating_sub(1)));
+    fill(&a.ui.queue_store, rest);
+}
+
 fn fill(store: &gio::ListStore, tracks: Vec<Track>) {
     let objs: Vec<glib::BoxedAnyObject> = tracks.into_iter().map(glib::BoxedAnyObject::new).collect();
     store.splice(0, store.n_items(), &objs);
@@ -377,6 +473,9 @@ fn play_current(a: &mut App) {
     if a.radio && a.idx + 4 >= a.queue.len() {
         request_more(a);
     }
+    if a.queue_open {
+        fill_queue(a);
+    }
 }
 
 fn start_queue(a: &mut App, queue: Vec<Track>, idx: usize) {
@@ -396,6 +495,21 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
             }
         }
         Msg::Cover(id, res) => covers::deliver(id, res),
+        Msg::QueueOpen => {
+            a.queue_open = true;
+            fill_queue(a);
+        }
+        Msg::QueueClosed => {
+            a.queue_open = false;
+            a.ui.queue_store.remove_all(); // libera a lista da memória
+        }
+        Msg::JumpTo(pos) => {
+            let i = a.idx + pos as usize;
+            if i < a.queue.len() {
+                a.idx = i;
+                play_current(a);
+            }
+        }
         Msg::Quit => {
             a.player.stop();
             if let Some(app) = gio::Application::default() {
@@ -422,6 +536,9 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
             if a.radio {
                 let have: HashSet<String> = a.queue.iter().map(|t| t.id.clone()).collect();
                 a.queue.extend(tracks.into_iter().filter(|t| !have.contains(&t.id)));
+                if a.queue_open {
+                    fill_queue(a);
+                }
             }
         }
         Msg::PlayRow { local, pos } => {
@@ -619,6 +736,13 @@ fn build_ui(gapp: &gtk::Application) {
     let bartist = label("", "dim");
     bt.append(&btitle);
     bt.append(&bartist);
+    let (queue_pop, queue_store, queue_title) = make_queue_popover(&tx);
+    let qbtn = gtk::MenuButton::new();
+    qbtn.set_child(Some(&bt));
+    qbtn.set_popover(Some(&queue_pop));
+    qbtn.set_direction(gtk::ArrowType::Up);
+    qbtn.add_css_class("qbtn");
+    qbtn.set_tooltip_text(Some("Ver fila de reprodução"));
     let bbadge = label("", "");
     bbadge.set_valign(gtk::Align::Center);
     let mk_btn = |icon: &str, main_btn: bool, msg: fn() -> Msg| {
@@ -649,7 +773,7 @@ fn build_ui(gapp: &gtk::Application) {
             glib::Propagation::Proceed
         }
     });
-    for w in [bpic.upcast_ref::<gtk::Widget>(), bt.upcast_ref(), bbadge.upcast_ref(), prev.upcast_ref(), play.upcast_ref(), next.upcast_ref(), cur.upcast_ref(), scale.upcast_ref(), total.upcast_ref()] {
+    for w in [bpic.upcast_ref::<gtk::Widget>(), qbtn.upcast_ref(), bbadge.upcast_ref(), prev.upcast_ref(), play.upcast_ref(), next.upcast_ref(), cur.upcast_ref(), scale.upcast_ref(), total.upcast_ref()] {
         player_bar.append(w);
     }
 
@@ -687,6 +811,8 @@ fn build_ui(gapp: &gtk::Application) {
             cloud_store,
             local_shelf,
             cloud_shelf,
+            queue_store,
+            queue_title,
             bar: Bar { pic: bpic, title: btitle, artist: bartist, badge: bbadge, play, scale, cur, total },
             progress,
             progress_label,
@@ -701,6 +827,7 @@ fn build_ui(gapp: &gtk::Application) {
         scope: Scope::All,
         radio: false,
         fetching_more: false,
+        queue_open: false,
     }));
     {
         let mut a = st.borrow_mut();

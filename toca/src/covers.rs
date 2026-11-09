@@ -20,6 +20,9 @@ struct State {
     inflight: HashSet<String>,
     waiting: HashMap<String, Vec<(glib::WeakRef<gtk::Picture>, i32)>>,
     offline_until: Option<Instant>,
+    urls: HashMap<String, String>,
+    attempts: HashMap<String, u8>,
+    fails_in_row: u8,
 }
 
 thread_local! { static ST: RefCell<State> = RefCell::new(State::default()); }
@@ -52,20 +55,15 @@ pub fn init(emit: impl Fn(String, Result<Vec<u8>, bool>) + Send + 'static) {
     std::thread::spawn(move || {
         let agent: ureq::Agent =
             ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(8))).build().into();
-        let mut offline_until: Option<Instant> = None;
+        let debug = std::env::var_os("TOCA_DEBUG").is_some();
         for (id, url) in rx {
-            if offline_until.is_some_and(|u| Instant::now() < u) {
-                emit(id, Err(true)); // já sabemos que está sem rede: não espera timeout
-                continue;
-            }
             match agent.get(&url).call().and_then(|mut r| r.body_mut().read_to_vec()) {
                 Ok(b) => emit(id, Ok(b)),
                 Err(e) => {
-                    let net = !matches!(e, ureq::Error::StatusCode(_));
-                    if net {
-                        offline_until = Some(Instant::now() + Duration::from_secs(20));
+                    if debug {
+                        eprintln!("[capa] {id}: {e}");
                     }
-                    emit(id, Err(net));
+                    emit(id, Err(!matches!(e, ureq::Error::StatusCode(_))));
                 }
             }
         }
@@ -90,20 +88,25 @@ pub fn apply(pic: &gtk::Picture, id: &str, thumb: &Option<String>, px: i32) {
         }
         s.waiting.entry(id.to_string()).or_default().push((pic.downgrade(), px));
         if s.inflight.insert(id.to_string()) {
+            let u = sized_url(url);
+            s.urls.insert(id.to_string(), u.clone());
             if let Some(tx) = &s.tx {
-                let _ = tx.send((id.to_string(), sized_url(url)));
+                let _ = tx.send((id.to_string(), u));
             }
         }
     });
 }
 
 pub fn deliver(id: String, res: Result<Vec<u8>, bool>) {
-    ST.with(|s| {
+    let retry = ST.with(|s| {
         let mut s = s.borrow_mut();
         s.inflight.remove(&id);
         let waiters = s.waiting.remove(&id).unwrap_or_default();
         match res {
             Ok(bytes) => {
+                s.fails_in_row = 0;
+                s.attempts.remove(&id);
+                s.urls.remove(&id);
                 if s.bytes.len() >= MAX_CACHED {
                     s.bytes.clear();
                 }
@@ -116,13 +119,47 @@ pub fn deliver(id: String, res: Result<Vec<u8>, bool>) {
                         }
                     }
                 }
-                s.bytes.insert(id, Rc::new(bytes));
+                s.bytes.insert(id.clone(), Rc::new(bytes));
+                false
             }
             Err(net) => {
                 if net {
-                    s.offline_until = Some(Instant::now() + Duration::from_secs(20));
+                    s.fails_in_row += 1;
+                    if s.fails_in_row >= 3 {
+                        // 3 falhas seguidas: provavelmente sem internet; pausa os pedidos por um tempo
+                        s.fails_in_row = 0;
+                        s.offline_until = Some(Instant::now() + Duration::from_secs(15));
+                    }
+                }
+                let n = {
+                    let e = s.attempts.entry(id.clone()).or_insert(0);
+                    *e += 1;
+                    *e
+                };
+                if n < 4 && !waiters.is_empty() {
+                    s.waiting.insert(id.clone(), waiters); // mantém quem espera a capa
+                    true
+                } else {
+                    s.attempts.remove(&id);
+                    s.urls.remove(&id);
+                    false
                 }
             }
         }
     });
+    if retry {
+        // tenta de novo em alguns segundos, sem exigir que a lista seja rolada
+        glib::timeout_add_seconds_local_once(4, move || {
+            ST.with(|s| {
+                let mut s = s.borrow_mut();
+                if let Some(url) = s.urls.get(&id).cloned() {
+                    if s.inflight.insert(id.clone()) {
+                        if let Some(tx) = &s.tx {
+                            let _ = tx.send((id.clone(), url));
+                        }
+                    }
+                }
+            });
+        });
+    }
 }
