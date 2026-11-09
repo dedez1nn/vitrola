@@ -33,6 +33,7 @@ impl Scope {
 
 enum Msg {
     Recs(u64, Vec<Track>),
+    More(Vec<Track>),
     Mpv(u64, MpvEv),
     Cover(String, Result<Vec<u8>, bool>),
     Downloaded(String, bool),
@@ -137,6 +138,8 @@ struct App {
     recs: Vec<Track>,
     seq: u64,
     scope: Scope,
+    radio: bool,
+    fetching_more: bool,
 }
 
 fn fmt_time(s: f64) -> String {
@@ -296,30 +299,49 @@ fn refresh_progress(a: &App) {
     a.ui.progress_label.set_text(&format!("{done} de {total} no disco"));
 }
 
+/// Roda `ytm-local recommend` (bloqueante; chamar fora da thread da interface).
+fn fetch_recs(scope: Scope, n: usize) -> Vec<Track> {
+    let out = Command::new(db::ytm_cmd())
+        .args(["recommend", "--scope", scope.arg(), "-n", &n.to_string(), "--json"])
+        .output();
+    let mut tracks = vec![];
+    if let Ok(o) = out {
+        if let Ok(serde_json::Value::Array(items)) = serde_json::from_slice(&o.stdout) {
+            for v in items {
+                let s = |k: &str| v[k].as_str().map(String::from);
+                tracks.push(Track {
+                    id: s("video_id").unwrap_or_default(),
+                    title: s("title").unwrap_or_default(),
+                    artists: s("artists").unwrap_or_default(),
+                    local: v["local"].as_bool().unwrap_or(false),
+                    path: s("path"),
+                    thumb: s("thumbnail"),
+                });
+            }
+        }
+    }
+    tracks
+}
+
+const BATCH: usize = 30; // tamanho da fila montada ao tocar um cartão
+
 fn request_recs(a: &mut App) {
     a.seq += 1;
     let (seq, scope, tx) = (a.seq, a.scope, a.tx.clone());
     std::thread::spawn(move || {
-        let out = Command::new(db::ytm_cmd())
-            .args(["recommend", "--scope", scope.arg(), "-n", "5", "--json"])
-            .output();
-        let mut tracks = vec![];
-        if let Ok(o) = out {
-            if let Ok(serde_json::Value::Array(items)) = serde_json::from_slice(&o.stdout) {
-                for v in items {
-                    let s = |k: &str| v[k].as_str().map(String::from);
-                    tracks.push(Track {
-                        id: s("video_id").unwrap_or_default(),
-                        title: s("title").unwrap_or_default(),
-                        artists: s("artists").unwrap_or_default(),
-                        local: v["local"].as_bool().unwrap_or(false),
-                        path: s("path"),
-                        thumb: s("thumbnail"),
-                    });
-                }
-            }
-        }
-        let _ = tx.send_blocking(Msg::Recs(seq, tracks));
+        let _ = tx.send_blocking(Msg::Recs(seq, fetch_recs(scope, BATCH)));
+    });
+}
+
+/// Fila quase acabando: busca mais faixas no mesmo escopo.
+fn request_more(a: &mut App) {
+    if a.fetching_more || !a.radio {
+        return;
+    }
+    a.fetching_more = true;
+    let (scope, tx) = (a.scope, a.tx.clone());
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(Msg::More(fetch_recs(scope, BATCH)));
     });
 }
 
@@ -350,8 +372,9 @@ fn play_current(a: &mut App) {
     b.cur.set_text("0:00");
     b.total.set_text("");
     b.play.set_icon_name("media-playback-pause-symbolic");
-    if t.local {
-        db::record_play(&a.conn, &t.id);
+    db::record_play(&a.conn, &t.id); // o recommend penaliza o que acabou de tocar (disco ou nuvem)
+    if a.radio && a.idx + 4 >= a.queue.len() {
+        request_more(a);
     }
 }
 
@@ -380,8 +403,19 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
             request_recs(a);
         }
         Msg::PlayCard(i) => {
-            let q = a.recs.clone();
-            start_queue(a, q, i);
+            if let Some(first) = a.recs.get(i).cloned() {
+                let mut q = vec![first];
+                q.extend(a.recs.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, t)| t.clone()));
+                a.radio = true;
+                start_queue(a, q, 0);
+            }
+        }
+        Msg::More(tracks) => {
+            a.fetching_more = false;
+            if a.radio {
+                let have: HashSet<String> = a.queue.iter().map(|t| t.id.clone()).collect();
+                a.queue.extend(tracks.into_iter().filter(|t| !have.contains(&t.id)));
+            }
         }
         Msg::PlayRow { local, pos } => {
             let store = if local { &a.ui.local_store } else { &a.ui.cloud_store };
@@ -390,6 +424,7 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
                 .filter_map(|i| store.item(i).and_downcast::<glib::BoxedAnyObject>())
                 .map(|o| o.borrow::<Track>().clone())
                 .collect();
+            a.radio = false;
             start_queue(a, q, 0);
         }
         Msg::Download(id) => {
@@ -657,6 +692,8 @@ fn build_ui(gapp: &gtk::Application) {
         recs: vec![],
         seq: 0,
         scope: Scope::All,
+        radio: false,
+        fetching_more: false,
     }));
     {
         let mut a = st.borrow_mut();
