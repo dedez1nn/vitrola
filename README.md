@@ -44,3 +44,18 @@ uv run ytm-local discover --new-artists --add 10        # só artistas novos; 10
 pouco de aleatoriedade (`--temperature`). `discover` sorteia sementes entre as favoritas, pega a rádio do YouTube
 Music de cada uma e ordena pelo que aparece em mais rádios; o que você já tem fica de fora.
 Rode `sync history` para o `recommend` usar o histórico.
+
+## Toca (app desktop)
+
+Interface "duas estantes" (disco x nuvem) em Rust + GTK4, pensada para gastar pouca RAM.
+
+```bash
+cd toca && cargo build --release
+./target/release/toca
+```
+
+- **Ouvir agora**: 5 sugestões do `ytm-local recommend --scope all --json`. O seletor Tudo / No disco / Na nuvem filtra.
+- **No disco** toca o arquivo local. **Na nuvem** toca por streaming (mpv + yt-dlp, com os cookies do Firefox) e tem o botão **Baixar** (`ytm-local download --id`).
+- **Capas**: não vão para o disco. São buscadas só quando há internet, ficam em memória (até ~300) e, sem rede, aparece um bloco neutro.
+- **RAM**: renderizador por software (`GSK_RENDERER=cairo`, use `TOCA_GPU=1` para o padrão do GTK), listas virtualizadas, um processo `mpv` por faixa que só existe enquanto toca, interface orientada a eventos (sem polling). Medido: ~40 MB de memória própria.
+- Variáveis: `TOCA_YTM` (caminho do `ytm-local`), `YTM_LOCAL_DATA` (onde fica o banco).

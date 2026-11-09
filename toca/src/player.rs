@@ -8,8 +8,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc::Sender,
-        Arc, Mutex,
+                Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -26,7 +25,7 @@ pub struct Player {
     child: Option<Child>,
     sock: std::path::PathBuf,
     writer: Arc<Mutex<Option<UnixStream>>>,
-    gen: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
 }
 
 impl Player {
@@ -36,12 +35,12 @@ impl Player {
             child: None,
             sock: dir.join(format!("toca-mpv-{}.sock", std::process::id())),
             writer: Arc::new(Mutex::new(None)),
-            gen: Arc::new(AtomicU64::new(0)),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub fn gen(&self) -> u64 {
-        self.gen.load(Ordering::SeqCst)
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     pub fn stop(&mut self) {
@@ -53,9 +52,9 @@ impl Player {
         let _ = fs::remove_file(&self.sock);
     }
 
-    pub fn play(&mut self, t: &Track, tx: Sender<(u64, MpvEv)>) {
+    pub fn play(&mut self, t: &Track, emit: Arc<dyn Fn(u64, MpvEv) + Send + Sync>) {
         self.stop();
-        let gen = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
 
         let mut cmd = Command::new("mpv");
         cmd.args([
@@ -74,19 +73,19 @@ impl Player {
         match cmd.spawn() {
             Ok(c) => self.child = Some(c),
             Err(_) => {
-                let _ = tx.send((gen, MpvEv::End("error".into())));
+                emit(generation, MpvEv::End("error".into()));
                 return;
             }
         }
 
         let sock = self.sock.clone();
         let writer = self.writer.clone();
-        let cur = self.gen.clone();
+        let cur = self.generation.clone();
         thread::spawn(move || {
             let mut stream = None;
             for _ in 0..150 {
                 // até ~15 s: o mpv da nuvem demora para resolver o stream
-                if cur.load(Ordering::SeqCst) != gen {
+                if cur.load(Ordering::SeqCst) != generation {
                     return;
                 }
                 if let Ok(s) = UnixStream::connect(&sock) {
@@ -96,14 +95,14 @@ impl Player {
                 thread::sleep(Duration::from_millis(100));
             }
             let Some(mut s) = stream else {
-                let _ = tx.send((gen, MpvEv::End("error".into())));
+                emit(generation, MpvEv::End("error".into()));
                 return;
             };
             for (i, p) in ["time-pos", "duration", "pause"].iter().enumerate() {
                 let _ = writeln!(s, r#"{{"command":["observe_property",{},"{}"]}}"#, i + 1, p);
             }
             if let Ok(w) = s.try_clone() {
-                if cur.load(Ordering::SeqCst) == gen {
+                if cur.load(Ordering::SeqCst) == generation {
                     *writer.lock().unwrap() = Some(w);
                 }
             }
@@ -116,25 +115,25 @@ impl Player {
                             if let Some(t) = d.as_f64() {
                                 if (t - last).abs() >= 0.5 {
                                     last = t;
-                                    let _ = tx.send((gen, MpvEv::Time(t)));
+                                    emit(generation, MpvEv::Time(t));
                                 }
                             }
                         }
                         (Some("duration"), d) => {
                             if let Some(t) = d.as_f64() {
-                                let _ = tx.send((gen, MpvEv::Duration(t)));
+                                emit(generation, MpvEv::Duration(t));
                             }
                         }
                         (Some("pause"), d) => {
                             if let Some(b) = d.as_bool() {
-                                let _ = tx.send((gen, MpvEv::Pause(b)));
+                                emit(generation, MpvEv::Pause(b));
                             }
                         }
                         _ => {}
                     },
                     Some("end-file") => {
                         let r = v["reason"].as_str().unwrap_or("eof").to_string();
-                        let _ = tx.send((gen, MpvEv::End(r)));
+                        emit(generation, MpvEv::End(r));
                     }
                     _ => {}
                 }

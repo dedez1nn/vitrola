@@ -10,6 +10,7 @@ pub struct Track {
     pub artists: String,
     pub local: bool,
     pub path: Option<String>,
+    pub thumb: Option<String>,
 }
 
 fn home() -> PathBuf {
@@ -21,14 +22,6 @@ pub fn db_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".local/share/ytm-local"))
         .join("state.db")
-}
-
-pub fn cover_path(id: &str) -> PathBuf {
-    env::var_os("YTM_LOCAL_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".cache/ytm-local"))
-        .join("covers")
-        .join(format!("{id}.jpg"))
 }
 
 /// Comando do ytm-local (recommend, download).
@@ -49,7 +42,7 @@ const LOCAL: &str = "status='done' AND path IS NOT NULL";
 /// Faixas no disco (`local`) ou só na nuvem, na ordem em que entraram na biblioteca.
 pub fn tracks(conn: &Connection, local: bool) -> Vec<Track> {
     let cond = if local { LOCAL.to_string() } else { format!("NOT ({LOCAL})") };
-    let sql = format!("SELECT video_id, title, artists, path FROM tracks WHERE {cond} ORDER BY rowid");
+    let sql = format!("SELECT video_id, title, artists, path, thumbnail FROM tracks WHERE {cond} ORDER BY rowid");
     let Ok(mut stmt) = conn.prepare(&sql) else { return vec![] };
     stmt.query_map([], |r| {
         Ok(Track {
@@ -58,6 +51,7 @@ pub fn tracks(conn: &Connection, local: bool) -> Vec<Track> {
             artists: r.get(2)?,
             local,
             path: if local { r.get(3)? } else { None },
+            thumb: r.get(4)?,
         })
     })
     .map(|rows| rows.flatten().collect())

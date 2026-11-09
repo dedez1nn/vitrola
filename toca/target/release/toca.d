@@ -1,1 +1,1 @@
-/home/andrelmi/repos/ytm-local/toca/target/release/toca: /home/andrelmi/repos/ytm-local/toca/src/main.rs
+/home/andrelmi/repos/ytm-local/toca/target/release/toca: /home/andrelmi/repos/ytm-local/toca/src/covers.rs /home/andrelmi/repos/ytm-local/toca/src/db.rs /home/andrelmi/repos/ytm-local/toca/src/main.rs /home/andrelmi/repos/ytm-local/toca/src/player.rs
