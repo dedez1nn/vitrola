@@ -59,6 +59,14 @@ def cmd_auth(args) -> None:
     print(f"Autenticação salva em {AUTH_FILE}")
 
 
+def _print_pending_estimate(conn, bitrate: int) -> None:
+    rows = pending_rows(conn, None, False)
+    if rows:
+        print(f"Pendentes: {len(rows)} faixas, ~{_fmt(estimate_bytes(rows, bitrate))} (a {bitrate} kbps)")
+    else:
+        print("Nada pendente.")
+
+
 def cmd_sync(args) -> None:
     if not AUTH_FILE.exists():
         raise SystemExit("Sem autenticação. Rode: ytm-local auth")
@@ -68,6 +76,7 @@ def cmd_sync(args) -> None:
     conn = connect(DB_FILE)
     for name, (seen, new) in sync(conn, AUTH_FILE, sources, args.limit).items():
         print(f"{name}: {seen} faixas, {new} novas")
+    _print_pending_estimate(conn, args.bitrate)
 
 
 def cmd_download(args) -> None:
@@ -98,6 +107,7 @@ def cmd_status(args) -> None:
     conn = connect(DB_FILE)
     for r in conn.execute("SELECT status, COUNT(*) n FROM tracks GROUP BY status"):
         print(f"{r['status']:8} {r['n']}")
+    _print_pending_estimate(conn, args.bitrate)
     print("--- por fonte ---")
     for r in conn.execute("SELECT source, COUNT(*) n FROM sources GROUP BY source ORDER BY n DESC"):
         print(f"{r['n']:6} {r['source']}")
@@ -116,6 +126,7 @@ def main() -> None:
     s.add_argument("sources", nargs="*", default=["all"],
                    choices=["all", "liked", "library", "history", "playlists"])
     s.add_argument("--limit", type=int, default=5000, help="máx. de faixas por fonte")
+    s.add_argument("--bitrate", type=int, default=128, help="kbps usado na estimativa de tamanho")
     s.set_defaults(fn=cmd_sync)
 
     d = sub.add_parser("download", help="baixa as faixas pendentes")
@@ -130,7 +141,9 @@ def main() -> None:
     d.add_argument("-y", "--yes", action="store_true", help="não pedir confirmação")
     d.set_defaults(fn=cmd_download)
 
-    sub.add_parser("status", help="resumo do estado").set_defaults(fn=cmd_status)
+    st = sub.add_parser("status", help="resumo do estado")
+    st.add_argument("--bitrate", type=int, default=128, help="kbps usado na estimativa de tamanho")
+    st.set_defaults(fn=cmd_status)
 
     args = p.parse_args()
     args.fn(args)
