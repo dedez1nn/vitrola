@@ -47,9 +47,12 @@ enum Msg {
     Seek(f64),
     SetScope(Scope),
     Quit,
-    QueueOpen,
-    QueueClosed,
+    ToggleNow,
+    CloseNow,
     JumpTo(u32),
+    RemoveAt(u32),
+    SetRadio(bool),
+    ClearUpcoming,
 }
 
 type Tx = Sender<Msg>;
@@ -96,7 +99,16 @@ listview > row:hover { background: #1D212A; }
 .pbtn.main { background: #4ADE9C; color: #07110C; border-radius: 999px; min-width: 40px; min-height: 40px; }
 .qbtn { background: transparent; border: none; box-shadow: none; padding: 4px 8px; border-radius: 8px; }
 .qbtn:hover { background: #1D212A; }
-popover.queue > contents { background: #161920; border: 1px solid #2A2F3A; border-radius: 12px; padding: 12px; color: #ECEEF1; }
+.np-title { font-size: 24px; font-weight: 700; }
+.np-artist { color: #A3ACB8; font-size: 15px; }
+.tab { font-weight: 600; font-size: 13px; letter-spacing: 1px; padding: 12px 0; border-bottom: 2px solid #ECEEF1; }
+.qrow { padding: 4px 8px; border-radius: 8px; }
+.qrow:hover { background: #1D212A; }
+.qrow.current { background: #1D212A; }
+.qrow.current .ctitle { color: #4ADE9C; }
+.rm { background: transparent; border: none; box-shadow: none; color: #A3ACB8; min-width: 32px; min-height: 32px; padding: 0; border-radius: 999px; }
+.rm:hover { background: #2A2F3A; color: #ECEEF1; }
+.np-check { color: #ECEEF1; }
 .current { background: #1D212A; border-radius: 8px; }
 progressbar trough { background: #2A2F3A; min-height: 6px; }
 progressbar progress { background: #4ADE9C; min-height: 6px; }
@@ -124,14 +136,27 @@ struct Bar {
     total: gtk::Label,
 }
 
+/// Página "Agora tocando": capa grande e a fila completa (como o Now Playing do ytfast).
+struct NowW {
+    root: gtk::Box,
+    pic: gtk::Picture,
+    title: gtk::Label,
+    artist: gtk::Label,
+    badge: gtk::Label,
+    count: gtk::Label,
+    auto: gtk::CheckButton,
+    store: gio::ListStore,
+    lv: gtk::ListView,
+}
+
 struct Ui {
     cards: Vec<CardW>,
     local_store: gio::ListStore,
     cloud_store: gio::ListStore,
     local_shelf: gtk::Box,
     cloud_shelf: gtk::Box,
-    queue_store: gio::ListStore,
-    queue_title: gtk::Label,
+    now: NowW,
+    stack: gtk::Stack,
     bar: Bar,
     progress: gtk::ProgressBar,
     progress_label: gtk::Label,
@@ -150,7 +175,7 @@ struct App {
     scope: Scope,
     radio: bool,
     fetching_more: bool,
-    queue_open: bool,
+    now_open: bool,
 }
 
 fn fmt_time(s: f64) -> String {
@@ -294,28 +319,123 @@ fn make_shelf(title: &str, hint: &str, local: bool, store: &gio::ListStore, tx: 
     shelf
 }
 
-/// Fila de reprodução: só existe com o popover aberto (a lista é esvaziada ao fechar).
-fn make_queue_popover(tx: &Tx) -> (gtk::Popover, gio::ListStore, gtk::Label) {
+thread_local! {
+    /// índice da faixa atual na fila, para destacar a linha ao ligar a lista
+    static CURRENT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn make_now_page(tx: &Tx) -> NowW {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.set_hexpand(true);
+    root.set_vexpand(true);
+
+    // topo: voltar
+    let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    top.set_margin_top(16);
+    top.set_margin_start(20);
+    let back = gtk::Button::from_icon_name("go-previous-symbolic");
+    back.add_css_class("pbtn");
+    back.set_tooltip_text(Some("Voltar (Esc)"));
+    back.connect_clicked({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send_blocking(Msg::CloseNow);
+        }
+    });
+    top.append(&back);
+    root.append(&top);
+
+    let body = gtk::Box::new(gtk::Orientation::Horizontal, 40);
+    body.set_margin_start(40);
+    body.set_margin_end(40);
+    body.set_margin_bottom(20);
+    body.set_vexpand(true);
+
+    // ---- esquerda: capa grande, título, artista
+    let left = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    left.set_hexpand(true);
+    let frame = gtk::AspectFrame::new(0.5, 0.5, 1.0, false);
+    frame.set_hexpand(true);
+    frame.set_vexpand(true);
+    let pic = cover_pic(120, 120);
+    pic.set_halign(gtk::Align::Fill);
+    pic.set_valign(gtk::Align::Fill);
+    frame.set_child(Some(&pic));
+    let center = |l: &gtk::Label| {
+        l.set_xalign(0.5);
+        l.set_halign(gtk::Align::Center);
+    };
+    let title = label("", "np-title");
+    let artist = label("", "np-artist");
+    let badge = label("", "");
+    center(&title);
+    center(&artist);
+    badge.set_halign(gtk::Align::Center);
+    left.append(&frame);
+    left.append(&title);
+    left.append(&artist);
+    left.append(&badge);
+
+    // ---- direita: aba "A seguir" com a fila
+    let right = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    right.set_size_request(440, -1);
+    let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let tab = label("A SEGUIR", "tab");
+    tab.set_hexpand(true);
+    let auto = gtk::CheckButton::with_label("Autoplay");
+    auto.add_css_class("np-check");
+    auto.set_tooltip_text(Some("Adiciona músicas parecidas quando a fila acabar"));
+    auto.connect_toggled({
+        let tx = tx.clone();
+        move |b| {
+            let _ = tx.send_blocking(Msg::SetRadio(b.is_active()));
+        }
+    });
+    let clear = gtk::Button::with_label("Limpar");
+    clear.add_css_class("dl");
+    clear.set_tooltip_text(Some("Remove as músicas depois desta"));
+    clear.connect_clicked({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send_blocking(Msg::ClearUpcoming);
+        }
+    });
+    tabs.append(&tab);
+    tabs.append(&auto);
+    tabs.append(&clear);
+    let count = label("", "dim");
+
     let store = gio::ListStore::new::<glib::BoxedAnyObject>();
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
-        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-        row.set_margin_top(3);
-        row.set_margin_bottom(3);
-        row.set_margin_start(4);
-        row.set_margin_end(4);
-        row.append(&cover_pic(36, 36));
-        let col = gtk::Box::new(gtk::Orientation::Vertical, 1);
-        col.set_hexpand(true);
-        col.set_valign(gtk::Align::Center);
-        col.append(&label("", ""));
-        col.append(&label("", "dim"));
-        row.append(&col);
-        let badge = label("", "");
-        badge.set_valign(gtk::Align::Center);
-        row.append(&badge);
-        item.set_child(Some(&row));
+    factory.connect_setup({
+        let tx = tx.clone();
+        move |_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            row.add_css_class("qrow");
+            row.append(&cover_pic(40, 40));
+            let col = gtk::Box::new(gtk::Orientation::Vertical, 1);
+            col.set_hexpand(true);
+            col.set_valign(gtk::Align::Center);
+            col.append(&label("", "ctitle"));
+            col.append(&label("", "dim"));
+            row.append(&col);
+            let badge = label("", "");
+            badge.set_valign(gtk::Align::Center);
+            row.append(&badge);
+            let rm = gtk::Button::from_icon_name("window-close-symbolic");
+            rm.add_css_class("rm");
+            rm.set_valign(gtk::Align::Center);
+            rm.set_tooltip_text(Some("Remover da fila"));
+            let tx = tx.clone();
+            rm.connect_clicked(move |b| {
+                if let Ok(i) = b.widget_name().parse::<u32>() {
+                    let _ = tx.send_blocking(Msg::RemoveAt(i));
+                }
+            });
+            row.append(&rm);
+            item.set_child(Some(&row));
+        }
     });
     factory.connect_bind(|_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -325,16 +445,21 @@ fn make_queue_popover(tx: &Tx) -> (gtk::Popover, gio::ListStore, gtk::Label) {
         let pic = row.first_child().and_downcast::<gtk::Picture>().unwrap();
         let col = pic.next_sibling().and_downcast::<gtk::Box>().unwrap();
         let badge = col.next_sibling().and_downcast::<gtk::Label>().unwrap();
+        let rm = badge.next_sibling().and_downcast::<gtk::Button>().unwrap();
         let title = col.first_child().and_downcast::<gtk::Label>().unwrap();
         let artist = title.next_sibling().and_downcast::<gtk::Label>().unwrap();
         title.set_text(&t.title);
         artist.set_text(&t.artists);
         set_badge(&badge, t.local, false);
-        covers::apply(&pic, &t.id, &t.thumb, 72);
-        // posição 0 é a faixa tocando agora
-        row.remove_css_class("current");
-        if item.position() == 0 {
-            row.add_css_class("current");
+        covers::apply(&pic, &t.id, &t.thumb, 80);
+        let pos = item.position();
+        rm.set_widget_name(&pos.to_string());
+        if pos == CURRENT.with(|c| c.get()) {
+            row.add_css_class("current"); // a que está tocando: destacada e sem botão de remover
+            rm.set_visible(false);
+        } else {
+            row.remove_css_class("current");
+            rm.set_visible(true);
         }
     });
     let lv = gtk::ListView::new(Some(gtk::NoSelection::new(Some(store.clone()))), Some(factory));
@@ -342,42 +467,50 @@ fn make_queue_popover(tx: &Tx) -> (gtk::Popover, gio::ListStore, gtk::Label) {
     lv.connect_activate({
         let tx = tx.clone();
         move |_, pos| {
-            if pos > 0 {
-                let _ = tx.send_blocking(Msg::JumpTo(pos));
-            }
+            let _ = tx.send_blocking(Msg::JumpTo(pos));
         }
     });
     let sw = gtk::ScrolledWindow::new();
     sw.set_child(Some(&lv));
-    sw.set_min_content_width(400);
-    sw.set_min_content_height(380);
+    sw.set_vexpand(true);
     sw.set_hscrollbar_policy(gtk::PolicyType::Never);
-    let title = label("A seguir", "shelf-title");
-    let col = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    col.append(&title);
-    col.append(&sw);
-    let pop = gtk::Popover::new();
-    pop.set_child(Some(&col));
-    pop.add_css_class("queue");
-    pop.connect_show({
-        let tx = tx.clone();
-        move |_| {
-            let _ = tx.send_blocking(Msg::QueueOpen);
-        }
-    });
-    pop.connect_closed({
-        let tx = tx.clone();
-        move |_| {
-            let _ = tx.send_blocking(Msg::QueueClosed);
-        }
-    });
-    (pop, store, title)
+    right.append(&tabs);
+    right.append(&count);
+    right.append(&sw);
+
+    body.append(&left);
+    body.append(&right);
+    root.append(&body);
+    NowW { root, pic, title, artist, badge, count, auto, store, lv }
 }
 
-fn fill_queue(a: &App) {
-    let rest: Vec<Track> = a.queue.iter().skip(a.idx).cloned().collect();
-    a.ui.queue_title.set_text(&format!("A seguir ({})", rest.len().saturating_sub(1)));
-    fill(&a.ui.queue_store, rest);
+/// Preenche a página com a faixa atual e a fila inteira (rola até a que está tocando).
+fn fill_now(a: &App) {
+    let n = &a.ui.now;
+    if let Some(t) = a.queue.get(a.idx) {
+        n.title.set_text(&t.title);
+        n.artist.set_text(&t.artists);
+        set_badge(&n.badge, t.local, true);
+        covers::apply_big(&n.pic, &t.id, &t.thumb, 544);
+    }
+    n.count.set_text(&format!("{} depois desta", a.queue.len().saturating_sub(a.idx + 1)));
+    CURRENT.with(|c| c.set(a.idx as u32));
+    fill(&n.store, a.queue.clone());
+    if n.auto.is_active() != a.radio {
+        n.auto.set_active(a.radio);
+    }
+    n.lv.scroll_to(a.idx as u32, gtk::ListScrollFlags::NONE, None);
+}
+
+/// Mostra ou esconde a página; ao esconder, libera a lista e a capa grande da memória.
+fn show_now(a: &mut App) {
+    a.ui.stack.set_visible_child_name(if a.now_open { "now" } else { "home" });
+    if a.now_open {
+        fill_now(a);
+    } else {
+        a.ui.now.store.remove_all();
+        a.ui.now.pic.set_paintable(gtk::gdk::Paintable::NONE);
+    }
 }
 
 fn fill(store: &gio::ListStore, tracks: Vec<Track>) {
@@ -473,8 +606,8 @@ fn play_current(a: &mut App) {
     if a.radio && a.idx + 4 >= a.queue.len() {
         request_more(a);
     }
-    if a.queue_open {
-        fill_queue(a);
+    if a.now_open {
+        fill_now(a);
     }
 }
 
@@ -495,19 +628,47 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
             }
         }
         Msg::Cover(id, res) => covers::deliver(id, res),
-        Msg::QueueOpen => {
-            a.queue_open = true;
-            fill_queue(a);
+        Msg::ToggleNow => {
+            if a.now_open || !a.queue.is_empty() {
+                a.now_open = !a.now_open;
+                show_now(a);
+            }
         }
-        Msg::QueueClosed => {
-            a.queue_open = false;
-            a.ui.queue_store.remove_all(); // libera a lista da memória
+        Msg::CloseNow => {
+            if a.now_open {
+                a.now_open = false;
+                show_now(a);
+            }
         }
         Msg::JumpTo(pos) => {
-            let i = a.idx + pos as usize;
-            if i < a.queue.len() {
+            let i = pos as usize;
+            if i < a.queue.len() && i != a.idx {
                 a.idx = i;
                 play_current(a);
+            }
+        }
+        Msg::RemoveAt(pos) => {
+            let i = pos as usize;
+            if i < a.queue.len() && i != a.idx {
+                a.queue.remove(i);
+                if i < a.idx {
+                    a.idx -= 1;
+                }
+                if a.now_open {
+                    fill_now(a);
+                }
+            }
+        }
+        Msg::SetRadio(on) => {
+            a.radio = on;
+            if on && a.idx + 4 >= a.queue.len() {
+                request_more(a);
+            }
+        }
+        Msg::ClearUpcoming => {
+            a.queue.truncate(a.idx + 1);
+            if a.now_open {
+                fill_now(a);
             }
         }
         Msg::Quit => {
@@ -536,8 +697,8 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
             if a.radio {
                 let have: HashSet<String> = a.queue.iter().map(|t| t.id.clone()).collect();
                 a.queue.extend(tracks.into_iter().filter(|t| !have.contains(&t.id)));
-                if a.queue_open {
-                    fill_queue(a);
+                if a.now_open {
+                    fill_now(a);
                 }
             }
         }
@@ -722,8 +883,15 @@ fn build_ui(gapp: &gtk::Application) {
 
     let top = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     top.set_vexpand(true);
+    let now = make_now_page(&tx);
+    let stack = gtk::Stack::new();
+    stack.set_hexpand(true);
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    stack.set_transition_duration(120);
+    stack.add_named(&main, Some("home"));
+    stack.add_named(&now.root, Some("now"));
     top.append(&side);
-    top.append(&main);
+    top.append(&stack);
 
     // ---------- player ----------
     let player_bar = gtk::Box::new(gtk::Orientation::Horizontal, 16);
@@ -736,13 +904,16 @@ fn build_ui(gapp: &gtk::Application) {
     let bartist = label("", "dim");
     bt.append(&btitle);
     bt.append(&bartist);
-    let (queue_pop, queue_store, queue_title) = make_queue_popover(&tx);
-    let qbtn = gtk::MenuButton::new();
+    let qbtn = gtk::Button::new();
     qbtn.set_child(Some(&bt));
-    qbtn.set_popover(Some(&queue_pop));
-    qbtn.set_direction(gtk::ArrowType::Up);
     qbtn.add_css_class("qbtn");
-    qbtn.set_tooltip_text(Some("Ver fila de reprodução"));
+    qbtn.set_tooltip_text(Some("Abrir Agora tocando e a fila"));
+    qbtn.connect_clicked({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send_blocking(Msg::ToggleNow);
+        }
+    });
     let bbadge = label("", "");
     bbadge.set_valign(gtk::Align::Center);
     let mk_btn = |icon: &str, main_btn: bool, msg: fn() -> Msg| {
@@ -811,8 +982,8 @@ fn build_ui(gapp: &gtk::Application) {
             cloud_store,
             local_shelf,
             cloud_shelf,
-            queue_store,
-            queue_title,
+            now,
+            stack,
             bar: Bar { pic: bpic, title: btitle, artist: bartist, badge: bbadge, play, scale, cur, total },
             progress,
             progress_label,
@@ -827,7 +998,7 @@ fn build_ui(gapp: &gtk::Application) {
         scope: Scope::All,
         radio: false,
         fetching_more: false,
-        queue_open: false,
+        now_open: false,
     }));
     {
         let mut a = st.borrow_mut();
@@ -878,6 +1049,17 @@ fn build_ui(gapp: &gtk::Application) {
             }
         });
     }
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed({
+        let tx = tx.clone();
+        move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                let _ = tx.send_blocking(Msg::CloseNow);
+            }
+            glib::Propagation::Proceed
+        }
+    });
+    win.add_controller(keys);
     win.connect_close_request({
         let st = st.clone();
         move |_| {

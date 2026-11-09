@@ -27,11 +27,11 @@ struct State {
 
 thread_local! { static ST: RefCell<State> = RefCell::new(State::default()); }
 
-/// Pede a imagem em 160 px quando for capa quadrada do YT Music.
-fn sized_url(u: &str) -> String {
+/// Pede a imagem em `size` px quando for capa quadrada do YT Music.
+fn sized_url(u: &str, size: u32) -> String {
     if u.contains("googleusercontent.com") {
         if let Some(i) = u.rfind("=w") {
-            return format!("{}=w160-h160-l90-rj", &u[..i]);
+            return format!("{}=w{size}-h{size}-l90-rj", &u[..i]);
         }
     }
     u.to_string()
@@ -72,11 +72,20 @@ pub fn init(emit: impl Fn(String, Result<Vec<u8>, bool>) + Send + 'static) {
 
 /// Mostra a capa em `pic` (pede à rede se ainda não estiver em memória).
 pub fn apply(pic: &gtk::Picture, id: &str, thumb: &Option<String>, px: i32) {
-    pic.set_widget_name(id); // linhas são recicladas: o nome diz a qual faixa a imagem pertence
+    apply_key(pic, id, thumb, px, 160);
+}
+
+/// Capa grande (página "Agora tocando"): só uma fica em memória por vez.
+pub fn apply_big(pic: &gtk::Picture, id: &str, thumb: &Option<String>, px: i32) {
+    apply_key(pic, &format!("{id}@big"), thumb, px, 544);
+}
+
+fn apply_key(pic: &gtk::Picture, key: &str, thumb: &Option<String>, px: i32, req: u32) {
+    pic.set_widget_name(key); // linhas são recicladas: o nome diz a qual imagem o widget pertence
     pic.set_paintable(gdk::Paintable::NONE);
     ST.with(|s| {
         let mut s = s.borrow_mut();
-        if let Some(b) = s.bytes.get(id) {
+        if let Some(b) = s.bytes.get(key) {
             if let Some(t) = texture(b, px) {
                 pic.set_paintable(Some(&t));
             }
@@ -86,12 +95,12 @@ pub fn apply(pic: &gtk::Picture, id: &str, thumb: &Option<String>, px: i32) {
         if s.offline_until.is_some_and(|u| Instant::now() < u) {
             return;
         }
-        s.waiting.entry(id.to_string()).or_default().push((pic.downgrade(), px));
-        if s.inflight.insert(id.to_string()) {
-            let u = sized_url(url);
-            s.urls.insert(id.to_string(), u.clone());
+        s.waiting.entry(key.to_string()).or_default().push((pic.downgrade(), px));
+        if s.inflight.insert(key.to_string()) {
+            let u = sized_url(url, req);
+            s.urls.insert(key.to_string(), u.clone());
             if let Some(tx) = &s.tx {
-                let _ = tx.send((id.to_string(), u));
+                let _ = tx.send((key.to_string(), u));
             }
         }
     });
@@ -109,6 +118,9 @@ pub fn deliver(id: String, res: Result<Vec<u8>, bool>) {
                 s.urls.remove(&id);
                 if s.bytes.len() >= MAX_CACHED {
                     s.bytes.clear();
+                }
+                if id.ends_with("@big") {
+                    s.bytes.retain(|k, _| !k.ends_with("@big")); // só a capa grande atual fica
                 }
                 for (w, px) in waiters {
                     if let Some(p) = w.upgrade() {
