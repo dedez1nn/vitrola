@@ -910,9 +910,20 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
         }
         Msg::PlayResult(pos) => {
             let q: Vec<Track> = a.results.iter().skip(pos as usize).take(100).cloned().collect();
-            if !q.is_empty() {
-                a.radio = false;
-                start_queue(a, q, 0);
+            if let Some(first) = q.first().cloned() {
+                if a.style {
+                    // fila do mesmo estilo da faixa escolhida, não os outros resultados da busca
+                    a.radio = true;
+                    let (seed, tx) = (first.id.clone(), a.tx.clone());
+                    start_queue(a, vec![first], 0);
+                    std::thread::spawn(move || {
+                        let t = fetch_similar(&seed, BATCH);
+                        let _ = tx.send_blocking(Msg::Similar(seed, t));
+                    });
+                } else {
+                    a.radio = false;
+                    start_queue(a, q, 0);
+                }
             }
         }
         Msg::Similar(seed, tracks) => {
