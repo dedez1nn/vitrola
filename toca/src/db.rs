@@ -100,10 +100,11 @@ pub fn history_count(conn: &Connection) -> i64 {
 }
 
 /// Abre o registro da reprodução (o recommend já penaliza a faixa a partir daqui). Devolve o rowid.
-pub fn start_play(conn: &Connection, t: &Track, reason: &str) -> Option<i64> {
+/// A linha já nasce com `listened_s`, senão o contador (que conta linhas com tempo medido) ficaria um atrás.
+pub fn start_play(conn: &Connection, t: &Track, reason: &str, listened: f64) -> Option<i64> {
     conn.execute(
-        "INSERT INTO plays (video_id, start_reason, local, title, artists) VALUES (?, ?, ?, ?, ?)",
-        rusqlite::params![t.id, reason, t.local as i64, t.title, t.artists],
+        "INSERT INTO plays (video_id, start_reason, local, title, artists, listened_s) VALUES (?, ?, ?, ?, ?, ?)",
+        rusqlite::params![t.id, reason, t.local as i64, t.title, t.artists, listened],
     )
     .ok()?;
     Some(conn.last_insert_rowid())
@@ -162,7 +163,8 @@ mod tests {
         migrate_plays(&conn);
         migrate_plays(&conn); // idempotente
 
-        let row = start_play(&conn, &track(), "card").unwrap();
+        let row = start_play(&conn, &track(), "card", 5.2).unwrap();
+        assert_eq!(history_count(&conn), 1); // conta já na inserção; a linha antiga (sem tempo) não entra
         update_play(&conn, row, 12.5, 200.0, None); // tique parcial: não define o fim
         let (l, d, s, e): (f64, f64, String, Option<String>) = conn
             .query_row("SELECT listened_s, duration_s, start_reason, end_reason FROM plays WHERE rowid=?", [row], |r| {

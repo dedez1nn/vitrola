@@ -1142,7 +1142,8 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
                         s.last = Some(t);
                         if s.row.is_none() && s.listened >= MIN_RECORD_S {
                             // a partir daqui o recommend também penaliza a faixa (disco ou nuvem)
-                            s.row = db::start_play(&a.conn, &s.track, s.start);
+                            s.row = db::start_play(&a.conn, &s.track, s.start, s.listened);
+                            s.flushed = s.listened;
                             recorded = s.row.is_some();
                         }
                     }
