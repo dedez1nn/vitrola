@@ -47,6 +47,8 @@ enum Msg {
     Pause,
     Seek(f64),
     SetScope(Scope),
+    PrevRecs,
+    NextRecs,
     Quit,
     ToggleNow,
     CloseNow,
@@ -184,10 +186,23 @@ struct Ui {
     bar: Bar,
     progress: gtk::ProgressBar,
     progress_label: gtk::Label,
+    history_label: gtk::Label,
+}
+
+/// Reprodução em andamento: o tempo ouvido soma só os avanços normais do player (pausa e seek não contam).
+struct Session {
+    track: Track,
+    start: &'static str,
+    row: Option<i64>, // só nasce depois de MIN_RECORD_S ouvidos: cliques acidentais e erros não viram histórico
+    listened: f64,
+    last: Option<f64>,
+    duration: f64,
+    flushed: f64,
 }
 
 struct App {
     conn: Connection,
+    sess: Option<Session>,
     ui: Ui,
     tx: Tx,
     emit: Arc<dyn Fn(u64, MpvEv) + Send + Sync>,
@@ -195,6 +210,7 @@ struct App {
     queue: Vec<Track>,
     idx: usize,
     recs: Vec<Track>,
+    rec_page: usize,
     seq: u64,
     scope: Scope,
     radio: bool,
@@ -714,6 +730,10 @@ fn refresh_progress(a: &App) {
     a.ui.progress_label.set_text(&format!("{done} de {total} no disco"));
 }
 
+fn refresh_history(a: &App) {
+    a.ui.history_label.set_text(&db::history_count(&a.conn).to_string());
+}
+
 fn parse_tracks(stdout: &[u8]) -> Vec<Track> {
     let mut tracks = vec![];
     if let Ok(serde_json::Value::Array(items)) = serde_json::from_slice(stdout) {
@@ -781,7 +801,7 @@ fn request_more(a: &mut App) {
 
 fn show_recs(a: &mut App) {
     for (i, c) in a.ui.cards.iter().enumerate() {
-        match a.recs.get(i) {
+        match a.recs.get(a.rec_page * 5 + i) {
             Some(t) => {
                 c.title.set_text(&t.title);
                 c.artist.set_text(&t.artists);
@@ -794,7 +814,35 @@ fn show_recs(a: &mut App) {
     }
 }
 
-fn play_current(a: &mut App) {
+const MIN_RECORD_S: f64 = 5.0;
+
+/// Fecha o registro da reprodução atual (idempotente). Quem não chegou a MIN_RECORD_S não deixa rastro.
+fn finish_play(a: &mut App, end: &str) {
+    if let Some(s) = a.sess.take() {
+        if let Some(row) = s.row {
+            db::update_play(&a.conn, row, s.listened, s.duration, Some(end));
+        }
+    }
+}
+
+/// Grava o tempo parcial (a cada tique) para não perder tudo se o app morrer de repente.
+fn flush_play(a: &mut App) {
+    if let Some(s) = a.sess.as_mut() {
+        if let (Some(row), true) = (s.row, s.listened != s.flushed) {
+            db::update_play(&a.conn, row, s.listened, s.duration, None);
+            s.flushed = s.listened;
+        }
+    }
+}
+
+/// `start` diz como a faixa começou; dele sai também por que a anterior terminou.
+fn play_current(a: &mut App, start: &'static str) {
+    let end = match start {
+        "auto" => "eof",
+        "next" | "prev" | "queue" => "skip",
+        _ => "replaced",
+    };
+    finish_play(a, end);
     let Some(t) = a.queue.get(a.idx).cloned() else { return };
     a.player.play(&t, a.emit.clone());
     let b = &a.ui.bar;
@@ -806,7 +854,7 @@ fn play_current(a: &mut App) {
     b.cur.set_text("0:00");
     b.total.set_text("");
     b.play.set_icon_name("media-playback-pause-symbolic");
-    db::record_play(&a.conn, &t.id); // o recommend penaliza o que acabou de tocar (disco ou nuvem)
+    a.sess = Some(Session { track: t.clone(), start, row: None, listened: 0.0, last: None, duration: 0.0, flushed: 0.0 });
     if a.radio && a.idx + 4 >= a.queue.len() {
         request_more(a);
     }
@@ -815,10 +863,10 @@ fn play_current(a: &mut App) {
     }
 }
 
-fn start_queue(a: &mut App, queue: Vec<Track>, idx: usize) {
+fn start_queue(a: &mut App, queue: Vec<Track>, idx: usize, start: &'static str) {
     a.queue = queue;
     a.idx = idx;
-    play_current(a);
+    play_current(a, start);
 }
 
 fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
@@ -828,6 +876,7 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
         Msg::Recs(seq, tracks) => {
             if seq == a.seq {
                 a.recs = tracks;
+                a.rec_page = 0;
                 show_recs(a);
             }
         }
@@ -848,7 +897,7 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
             let i = pos as usize;
             if i < a.queue.len() && i != a.idx {
                 a.idx = i;
-                play_current(a);
+                play_current(a, "queue");
             }
         }
         Msg::RemoveAt(pos) => {
@@ -915,14 +964,14 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
                     // fila do mesmo estilo da faixa escolhida, não os outros resultados da busca
                     a.radio = true;
                     let (seed, tx) = (first.id.clone(), a.tx.clone());
-                    start_queue(a, vec![first], 0);
+                    start_queue(a, vec![first], 0, "search");
                     std::thread::spawn(move || {
                         let t = fetch_similar(&seed, BATCH);
                         let _ = tx.send_blocking(Msg::Similar(seed, t));
                     });
                 } else {
                     a.radio = false;
-                    start_queue(a, q, 0);
+                    start_queue(a, q, 0, "search");
                 }
             }
         }
@@ -969,25 +1018,45 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
             }
         }
         Msg::Quit => {
+            finish_play(a, "quit");
             a.player.stop();
             if let Some(app) = gio::Application::default() {
                 app.quit();
             }
         }
-        Msg::Tick => refresh_progress(a),
+        Msg::Tick => {
+            refresh_progress(a);
+            flush_play(a);
+        }
         Msg::SetScope(s) => {
             a.scope = s;
             a.ui.local_shelf.set_visible(s != Scope::Cloud);
             a.ui.cloud_shelf.set_visible(s != Scope::Local);
             request_recs(a);
         }
+        Msg::PrevRecs => {
+            if a.rec_page > 0 {
+                a.rec_page -= 1;
+                show_recs(a);
+            }
+        }
+        Msg::NextRecs => {
+            // percorre o lote já buscado de 5 em 5; acabou, pede um novo
+            if (a.rec_page + 1) * 5 < a.recs.len() {
+                a.rec_page += 1;
+                show_recs(a);
+            } else {
+                request_recs(a);
+            }
+        }
         Msg::PlayCard(i) => {
+            let i = a.rec_page * 5 + i;
             if let Some(first) = a.recs.get(i).cloned() {
                 a.radio = true;
                 if a.style {
                     // toca já; a fila do mesmo estilo chega em ~1-2 s
                     let (seed, tx) = (first.id.clone(), a.tx.clone());
-                    start_queue(a, vec![first], 0);
+                    start_queue(a, vec![first], 0, "card");
                     std::thread::spawn(move || {
                         let t = fetch_similar(&seed, BATCH);
                         let _ = tx.send_blocking(Msg::Similar(seed, t));
@@ -995,7 +1064,7 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
                 } else {
                     let mut q = vec![first];
                     q.extend(a.recs.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, t)| t.clone()));
-                    start_queue(a, q, 0);
+                    start_queue(a, q, 0, "card");
                 }
             }
         }
@@ -1017,7 +1086,7 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
                 .map(|o| o.borrow::<Track>().clone())
                 .collect();
             a.radio = false;
-            start_queue(a, q, 0);
+            start_queue(a, q, 0, "row");
         }
         Msg::Download(id) => {
             if DOWNLOADING.with(|d| d.borrow_mut().insert(id.clone())) {
@@ -1046,12 +1115,12 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
         Msg::Next => {
             if a.idx + 1 < a.queue.len() {
                 a.idx += 1;
-                play_current(a);
+                play_current(a, "next");
             }
         }
         Msg::Prev => {
             a.idx = a.idx.saturating_sub(1);
-            play_current(a);
+            play_current(a, "prev");
         }
         Msg::Pause => a.player.toggle_pause(),
         Msg::Seek(v) => a.player.seek(v),
@@ -1062,10 +1131,31 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
             let b = &a.ui.bar;
             match ev {
                 MpvEv::Time(t) => {
+                    let mut recorded = false;
+                    if let Some(s) = a.sess.as_mut() {
+                        if let Some(last) = s.last {
+                            let d = t - last;
+                            if d > 0.0 && d <= 3.0 {
+                                s.listened += d;
+                            }
+                        }
+                        s.last = Some(t);
+                        if s.row.is_none() && s.listened >= MIN_RECORD_S {
+                            // a partir daqui o recommend também penaliza a faixa (disco ou nuvem)
+                            s.row = db::start_play(&a.conn, &s.track, s.start);
+                            recorded = s.row.is_some();
+                        }
+                    }
+                    if recorded {
+                        refresh_history(a); // o contador sobe no instante em que a reprodução é registrada
+                    }
                     b.scale.set_value(t);
                     b.cur.set_text(&fmt_time(t));
                 }
                 MpvEv::Duration(d) => {
+                    if let Some(s) = a.sess.as_mut() {
+                        s.duration = d;
+                    }
                     b.scale.set_range(0.0, d.max(1.0));
                     b.total.set_text(&fmt_time(d));
                 }
@@ -1076,16 +1166,18 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
                     "eof" => {
                         if a.idx + 1 < a.queue.len() {
                             a.idx += 1;
-                            play_current(a);
+                            play_current(a, "auto");
                         } else {
+                            finish_play(a, "eof");
                             a.player.stop();
-                            b.play.set_icon_name("media-playback-start-symbolic");
+                            a.ui.bar.play.set_icon_name("media-playback-start-symbolic");
                         }
                     }
                     "error" => {
+                        finish_play(a, "error");
                         a.player.stop();
-                        b.artist.set_text("Não foi possível tocar (sem internet?)");
-                        b.play.set_icon_name("media-playback-start-symbolic");
+                        a.ui.bar.artist.set_text("Não foi possível tocar (sem internet?)");
+                        a.ui.bar.play.set_icon_name("media-playback-start-symbolic");
                     }
                     _ => {}
                 },
@@ -1143,6 +1235,14 @@ fn build_ui(gapp: &gtk::Application) {
     card.append(&progress);
     card.append(&progress_label);
     side.append(&card);
+    let hist_card = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    hist_card.add_css_class("shelf");
+    let history_label = label("0", "h1");
+    history_label.set_xalign(0.0);
+    hist_card.append(&label("Histórico", "dim"));
+    hist_card.append(&history_label);
+    hist_card.append(&label("reproduções registradas", "dim"));
+    side.append(&hist_card);
 
     // ---------- conteúdo ----------
     let main = gtk::Box::new(gtk::Orientation::Vertical, 20);
@@ -1170,6 +1270,26 @@ fn build_ui(gapp: &gtk::Application) {
     for b in [&b_all, &b_local, &b_cloud] {
         seg.append(b);
     }
+    let refresh = gtk::Button::from_icon_name("go-next-symbolic");
+    refresh.set_tooltip_text(Some("Ver mais sugestões"));
+    refresh.set_valign(gtk::Align::End);
+    refresh.connect_clicked({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send_blocking(Msg::NextRecs);
+        }
+    });
+    let prev = gtk::Button::from_icon_name("go-previous-symbolic");
+    prev.set_tooltip_text(Some("Sugestões anteriores"));
+    prev.set_valign(gtk::Align::End);
+    prev.connect_clicked({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send_blocking(Msg::PrevRecs);
+        }
+    });
+    head.append(&prev);
+    head.append(&refresh);
     head.append(&seg);
     main.append(&head);
 
@@ -1350,6 +1470,7 @@ fn build_ui(gapp: &gtk::Application) {
             bar: Bar { pic: bpic, title: btitle, artist: bartist, badge: bbadge, play, scale, cur, total, mute: mute_btn },
             progress,
             progress_label,
+            history_label,
         },
         tx: tx.clone(),
         emit,
@@ -1361,6 +1482,8 @@ fn build_ui(gapp: &gtk::Application) {
         queue: vec![],
         idx: 0,
         recs: vec![],
+        sess: None,
+        rec_page: 0,
         seq: 0,
         scope: Scope::All,
         radio: false,
@@ -1376,6 +1499,7 @@ fn build_ui(gapp: &gtk::Application) {
         refresh_lists(&a);
         rebuild_index(&mut a);
         refresh_progress(&a);
+        refresh_history(&a);
         request_recs(&mut a);
     }
 
@@ -1439,7 +1563,9 @@ fn build_ui(gapp: &gtk::Application) {
     win.connect_close_request({
         let st = st.clone();
         move |_| {
-            st.borrow_mut().player.stop();
+            let mut a = st.borrow_mut();
+            finish_play(&mut a, "quit");
+            a.player.stop();
             glib::Propagation::Proceed
         }
     });

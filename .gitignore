@@ -11,3 +11,13 @@ wheels/
 
 # Rust
 toca/target/
+
+# Estado local e credenciais (vivem em ~/.local/share/ytm-local, mas nunca devem entrar no repo)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+headers_auth.json
+cookies.txt
