@@ -5,18 +5,7 @@ from collections import Counter, defaultdict
 
 from .genre import main_genre
 from .recommend import first_artist
-
-MIN_SECONDS = 30
-MIN_FRACTION = 0.5
-
-
-def counted(listened: float | None, duration: float | None) -> bool:
-    """Uma reprodução 'conta' com 30 s ou 50% da faixa, o que vier primeiro. Aplicada na leitura."""
-    if listened is None:
-        return False
-    need = MIN_SECONDS if not duration else min(MIN_SECONDS, MIN_FRACTION * duration)
-    return listened >= need
-
+from .rules import MIN_FRACTION, MIN_SECONDS, counted
 
 def load(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(

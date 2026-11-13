@@ -5,6 +5,7 @@ Sinais usados (todos locais):
 - fonte: curtida > playlist > biblioteca;
 - 'esquecida': está no acervo mas não aparece no histórico recente (modo fresh);
 - repetição: o que o próprio programa já tocou nos últimos dias é penalizado;
+- saturação: quanto mais uma faixa foi reproduzida nas últimas semanas (relativo ao seu ritmo), menos ela sobe;
 - diversidade: cada artista escolhido reduz o peso dos próximos;
 - exploração: ruído (Gumbel) controlado por --temperature, para não ser sempre a mesma lista.
 """
@@ -16,6 +17,7 @@ import sqlite3
 from collections import Counter
 
 from .download import MAX_SECONDS
+from .rules import counted
 
 SOURCE_WEIGHT = {"liked": 1.0, "library": 0.3}
 PLAYLIST_WEIGHT = 0.5
@@ -24,6 +26,43 @@ PLAYLIST_WEIGHT = 0.5
 def first_artist(artists: str) -> str:
     """Chave de agrupamento: 'Henrique, Juliano' e 'Henrique & Juliano' viram o mesmo artista."""
     return re.split(r",|&| e | feat\.? ", artists or "", maxsplit=1)[0].strip().lower()
+
+
+# saturação por faixa: janelas curta e longa, e quanto cada uma pesa (log, então a 1ª repetição pesa mais)
+SAT_SHORT_DAYS, SAT_LONG_DAYS = 7, 30
+SAT_SHORT_W, SAT_LONG_W = 0.6, 0.4
+SAT_BASE_DAYS = 90  # histórico usado para saber qual é o seu ritmo habitual
+SAT_RATIO_MIN, SAT_RATIO_MAX = 0.5, 3.0
+
+
+def saturation(conn: sqlite3.Connection) -> dict[str, float]:
+    """video_id -> penalidade (>= 0) por reproduções recentes da faixa.
+
+    A contagem é dividida pelo quanto você ouviu na janela em relação ao seu ritmo habitual: numa semana em que
+    você ouviu muito mais que o normal, a mesma contagem pesa menos. Linhas antigas, sem tempo medido, contam
+    como uma reprodução (o app só as gravava ao iniciar)."""
+    rows = conn.execute(
+        "SELECT video_id, listened_s, duration_s, julianday('now') - julianday(played_at) AS days "
+        f"FROM plays WHERE played_at >= datetime('now', '-{SAT_BASE_DAYS} days')"
+    ).fetchall()
+    plays = [(r["video_id"], r["days"]) for r in rows if r["listened_s"] is None or counted(r["listened_s"], r["duration_s"])]
+    if not plays:
+        return {}
+
+    def window(days: int) -> Counter:
+        return Counter(v for v, d in plays if d <= days)
+
+    def ratio(days: int) -> float:
+        in_window = sum(1 for _, d in plays if d <= days)
+        expected = max(1.0, len(plays) * days / SAT_BASE_DAYS)
+        return min(SAT_RATIO_MAX, max(SAT_RATIO_MIN, in_window / expected))
+
+    short, long_ = window(SAT_SHORT_DAYS), window(SAT_LONG_DAYS)
+    rs, rl = ratio(SAT_SHORT_DAYS), ratio(SAT_LONG_DAYS)
+    return {
+        v: SAT_SHORT_W * math.log1p(short[v] / rs) + SAT_LONG_W * math.log1p(long_[v] / rl)
+        for v in set(short) | set(long_)
+    }
 
 
 def recommend_now(
@@ -67,6 +106,7 @@ def recommend_now(
     }
 
     has_history = any("history" in s for s in sources.values())
+    sat = saturation(conn)
 
     scored = []
     for r in rows:
@@ -102,6 +142,11 @@ def recommend_now(
         if days is not None:
             score -= 2.0 * math.exp(-days / 3)  # meia-vida de ~2 dias
             why.append(f"tocada há {days:.0f}d")
+
+        penalty = sat.get(r["video_id"], 0.0)
+        if penalty > 0.05:
+            score -= penalty
+            why.append("muito tocada ultimamente")
 
         if scope == "all" and is_local(r):
             score += 0.5  # empate: o que está no disco vem primeiro
