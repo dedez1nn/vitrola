@@ -1240,7 +1240,7 @@ fn build_ui(gapp: &gtk::Application) {
     let side = gtk::Box::new(gtk::Orientation::Vertical, 18);
     side.add_css_class("sidebar");
     side.set_size_request(220, -1);
-    side.append(&label("Toca", "brand"));
+    side.append(&label("Vitrola", "brand"));
     let nav = |txt: &str, cls: &str| {
         let b = gtk::Button::with_label(txt);
         b.add_css_class("nav");
@@ -1471,7 +1471,7 @@ fn build_ui(gapp: &gtk::Application) {
     vol.set_value(vol0); // antes de ligar o sinal: não dispara a mensagem
     vol.set_size_request(110, -1);
     vol.set_valign(gtk::Align::Center);
-    vol.set_tooltip_text(Some("Volume do Toca"));
+    vol.set_tooltip_text(Some("Volume da Vitrola"));
     vol.connect_change_value({
         let tx = tx.clone();
         move |_, _, v| {
@@ -1489,7 +1489,7 @@ fn build_ui(gapp: &gtk::Application) {
 
     let win = gtk::ApplicationWindow::builder()
         .application(gapp)
-        .title("Toca")
+        .title("Vitrola")
         .default_width(1180)
         .default_height(760)
         .child(&root)

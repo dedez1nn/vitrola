@@ -9,6 +9,10 @@ linha de comando que sincroniza a conta, baixa o áudio (m4a original, sem reenc
 
 ## Vitrola (o app)
 
+![Tela inicial do Vitrola: sugestões em "Ouvir agora" e as estantes No disco e Na nuvem](docs/img/ouvir-agora.png)
+
+*Tela inicial. As músicas e artistas das imagens são fictícios.*
+
 ```bash
 cd toca && cargo build --release
 ./target/release/vitrola
@@ -21,6 +25,8 @@ filtra a origem. Os botões de seta ao lado percorrem as 30 sugestões já busca
 quando elas acabam. Tocar um cartão monta a fila a partir dele.
 
 ### Tocar
+
+![Agora tocando: capa grande e a fila "A seguir"](docs/img/agora-tocando.png)
 
 - **No disco** toca o arquivo local. **Na nuvem** toca por streaming (mpv + yt-dlp, com os cookies do Firefox) e tem o
   botão **Baixar** (`ytm-local download --id`).
