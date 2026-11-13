@@ -48,6 +48,8 @@ enum Msg {
     Seek(f64),
     SetScope(Scope),
     PrevRecs,
+    RemoveLastPlay,
+    UndoRemovePlay,
     NextRecs,
     Quit,
     ToggleNow,
@@ -187,6 +189,8 @@ struct Ui {
     progress: gtk::ProgressBar,
     progress_label: gtk::Label,
     history_label: gtk::Label,
+    remove_play: gtk::Button,
+    undo_play: gtk::Button,
 }
 
 /// Reprodução em andamento: o tempo ouvido soma só os avanços normais do player (pausa e seek não contam).
@@ -203,6 +207,7 @@ struct Session {
 struct App {
     conn: Connection,
     sess: Option<Session>,
+    removed_plays: Vec<db::PlayRow>, // pilha do desfazer
     ui: Ui,
     tx: Tx,
     emit: Arc<dyn Fn(u64, MpvEv) + Send + Sync>,
@@ -732,6 +737,17 @@ fn refresh_progress(a: &App) {
 
 fn refresh_history(a: &App) {
     a.ui.history_label.set_text(&db::history_count(&a.conn).to_string());
+    let last = db::last_play(&a.conn);
+    a.ui.remove_play.set_sensitive(last.is_some());
+    a.ui.remove_play.set_tooltip_text(Some(&match &last {
+        Some(p) => format!("Remover do histórico: {}", p.title.as_deref().unwrap_or("última reprodução")),
+        None => "Nenhuma reprodução registrada".to_string(),
+    }));
+    a.ui.undo_play.set_sensitive(!a.removed_plays.is_empty());
+    a.ui.undo_play.set_tooltip_text(Some(&match a.removed_plays.last() {
+        Some(p) => format!("Desfazer: {}", p.title.as_deref().unwrap_or("reprodução removida")),
+        None => "Nada para desfazer".to_string(),
+    }));
 }
 
 fn parse_tracks(stdout: &[u8]) -> Vec<Track> {
@@ -1034,6 +1050,22 @@ fn handle(st: &Rc<RefCell<App>>, msg: Msg) {
             a.ui.cloud_shelf.set_visible(s != Scope::Local);
             request_recs(a);
         }
+        Msg::RemoveLastPlay => {
+            if let Some(p) = db::last_play(&a.conn) {
+                if db::delete_play(&a.conn, p.rowid) {
+                    a.removed_plays.push(p);
+                }
+            }
+            refresh_history(a);
+        }
+        Msg::UndoRemovePlay => {
+            if let Some(p) = a.removed_plays.pop() {
+                if !db::restore_play(&a.conn, &p) {
+                    a.removed_plays.push(p); // não conseguiu devolver: mantém para tentar de novo
+                }
+            }
+            refresh_history(a);
+        }
         Msg::PrevRecs => {
             if a.rec_page > 0 {
                 a.rec_page -= 1;
@@ -1240,7 +1272,27 @@ fn build_ui(gapp: &gtk::Application) {
     hist_card.add_css_class("shelf");
     let history_label = label("0", "h1");
     history_label.set_xalign(0.0);
+    let remove_play = gtk::Button::from_icon_name("edit-delete-symbolic");
+    let undo_play = gtk::Button::from_icon_name("edit-undo-symbolic");
+    remove_play.set_hexpand(true);
+    undo_play.set_hexpand(true);
+    remove_play.connect_clicked({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send_blocking(Msg::RemoveLastPlay);
+        }
+    });
+    undo_play.connect_clicked({
+        let tx = tx.clone();
+        move |_| {
+            let _ = tx.send_blocking(Msg::UndoRemovePlay);
+        }
+    });
+    let hist_btns = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    hist_btns.append(&remove_play);
+    hist_btns.append(&undo_play);
     hist_card.append(&label("Histórico", "dim"));
+    hist_card.append(&hist_btns);
     hist_card.append(&history_label);
     hist_card.append(&label("reproduções registradas", "dim"));
     side.append(&hist_card);
@@ -1472,6 +1524,8 @@ fn build_ui(gapp: &gtk::Application) {
             progress,
             progress_label,
             history_label,
+            remove_play,
+            undo_play,
         },
         tx: tx.clone(),
         emit,
@@ -1483,6 +1537,7 @@ fn build_ui(gapp: &gtk::Application) {
         queue: vec![],
         idx: 0,
         recs: vec![],
+        removed_plays: vec![],
         sess: None,
         rec_page: 0,
         seq: 0,

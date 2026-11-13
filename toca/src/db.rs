@@ -99,6 +99,64 @@ pub fn history_count(conn: &Connection) -> i64 {
     conn.query_row("SELECT COUNT(*) FROM plays WHERE listened_s IS NOT NULL", [], |r| r.get(0)).unwrap_or(0)
 }
 
+/// Uma linha de `plays` por inteiro, para poder apagar e depois restaurar exatamente como estava.
+#[derive(Clone, Debug)]
+pub struct PlayRow {
+    pub rowid: i64,
+    pub video_id: String,
+    pub played_at: String,
+    pub listened: Option<f64>,
+    pub duration: Option<f64>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub local: Option<i64>,
+    pub title: Option<String>,
+    pub artists: Option<String>,
+}
+
+/// A última reprodução registrada (com tempo medido; as linhas antigas não entram).
+pub fn last_play(conn: &Connection) -> Option<PlayRow> {
+    conn.query_row(
+        "SELECT rowid, video_id, played_at, listened_s, duration_s, start_reason, end_reason, local, title, artists \
+         FROM plays WHERE listened_s IS NOT NULL ORDER BY rowid DESC LIMIT 1",
+        [],
+        |r| {
+            Ok(PlayRow {
+                rowid: r.get(0)?,
+                video_id: r.get(1)?,
+                played_at: r.get(2)?,
+                listened: r.get(3)?,
+                duration: r.get(4)?,
+                start: r.get(5)?,
+                end: r.get(6)?,
+                local: r.get(7)?,
+                title: r.get(8)?,
+                artists: r.get(9)?,
+            })
+        },
+    )
+    .ok()
+}
+
+pub fn delete_play(conn: &Connection, rowid: i64) -> bool {
+    conn.execute("DELETE FROM plays WHERE rowid = ?", [rowid]).is_ok_and(|n| n > 0)
+}
+
+/// Devolve a linha ao banco. Tenta o mesmo rowid; se uma reprodução nova já o ocupou, usa outro
+/// (o `played_at` original mantém a ordem no tempo).
+pub fn restore_play(conn: &Connection, p: &PlayRow) -> bool {
+    let cols = "video_id, played_at, listened_s, duration_s, start_reason, end_reason, local, title, artists";
+    let vals = rusqlite::params![p.video_id, p.played_at, p.listened, p.duration, p.start, p.end, p.local, p.title, p.artists];
+    let same = conn.execute(
+        &format!("INSERT INTO plays (rowid, {cols}) VALUES ({}, ?, ?, ?, ?, ?, ?, ?, ?, ?)", p.rowid),
+        vals,
+    );
+    if same.is_ok() {
+        return true;
+    }
+    conn.execute(&format!("INSERT INTO plays ({cols}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"), vals).is_ok()
+}
+
 /// Abre o registro da reprodução (o recommend já penaliza a faixa a partir daqui). Devolve o rowid.
 /// A linha já nasce com `listened_s`, senão o contador (que conta linhas com tempo medido) ficaria um atrás.
 pub fn start_play(conn: &Connection, t: &Track, reason: &str, listened: f64) -> Option<i64> {
@@ -179,6 +237,22 @@ mod tests {
             .query_row("SELECT listened_s, end_reason FROM plays WHERE rowid=?", [row], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert_eq!((l, e.as_str()), (41.0, "skip"));
+
+        // remover a última e desfazer
+        let ultima = last_play(&conn).unwrap();
+        assert_eq!(ultima.rowid, row);
+        assert!(delete_play(&conn, row));
+        assert_eq!(history_count(&conn), 0);
+        assert!(last_play(&conn).is_none()); // a linha antiga (sem tempo) não é removível por aqui
+        assert!(restore_play(&conn, &ultima));
+        let volta = last_play(&conn).unwrap();
+        assert_eq!((volta.rowid, volta.listened, volta.end.as_deref(), volta.played_at.as_str()), (row, Some(41.0), Some("skip"), ultima.played_at.as_str()));
+        // rowid ocupado por outra reprodução: restaura com outro rowid, sem perder nenhuma
+        assert!(delete_play(&conn, row));
+        let nova = start_play(&conn, &track(), "next", 6.0).unwrap();
+        assert_eq!(nova, row); // o SQLite reaproveitou o rowid
+        assert!(restore_play(&conn, &ultima));
+        assert_eq!(history_count(&conn), 2);
 
         let antigas: i64 = conn.query_row("SELECT COUNT(*) FROM plays WHERE listened_s IS NULL", [], |r| r.get(0)).unwrap();
         assert_eq!(antigas, 1); // a linha antiga segue intacta
