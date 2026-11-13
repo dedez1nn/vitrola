@@ -25,6 +25,21 @@ CREATE TABLE IF NOT EXISTS plays (
     video_id  TEXT NOT NULL,
     played_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS plays_played_at ON plays(played_at);
+CREATE TABLE IF NOT EXISTS artist_tags (
+    artist TEXT NOT NULL,  -- chave de recommend.first_artist
+    tag    TEXT NOT NULL,
+    weight INTEGER NOT NULL DEFAULT 1,
+    source TEXT NOT NULL,  -- manual | itunes | deezer
+    PRIMARY KEY (artist, tag, source)
+);
+CREATE TABLE IF NOT EXISTS artist_lookups (
+    artist     TEXT NOT NULL,
+    source     TEXT NOT NULL,
+    found      INTEGER NOT NULL,
+    fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (artist, source)
+);
 CREATE TABLE IF NOT EXISTS discoveries (
     video_id TEXT PRIMARY KEY,
     title    TEXT NOT NULL,
@@ -38,6 +53,18 @@ CREATE TABLE IF NOT EXISTS discoveries (
 """
 
 
+# colunas do histórico de reprodução (o toca também as cria se faltarem)
+PLAYS_EXTRA = [
+    ("listened_s", "REAL"),      # segundos realmente ouvidos (sem pausa)
+    ("duration_s", "REAL"),
+    ("start_reason", "TEXT"),    # card | row | search | queue | next | prev | auto
+    ("end_reason", "TEXT"),      # eof | skip | replaced | quit | error | NULL (app morreu)
+    ("local", "INTEGER"),        # 1 = tocou do disco
+    ("title", "TEXT"),
+    ("artists", "TEXT"),
+]
+
+
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
@@ -47,6 +74,11 @@ def connect(path: Path) -> sqlite3.Connection:
     if "thumbnail" not in cols:  # bancos criados antes das capas
         conn.execute("ALTER TABLE tracks ADD COLUMN thumbnail TEXT")
         conn.commit()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(plays)")}
+    for name, typ in PLAYS_EXTRA:
+        if name not in cols:  # bancos criados antes do histórico detalhado
+            conn.execute(f"ALTER TABLE plays ADD COLUMN {name} {typ}")
+    conn.commit()
     return conn
 
 

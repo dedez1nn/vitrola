@@ -35,7 +35,35 @@ pub fn ytm_cmd() -> PathBuf {
 pub fn open() -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path())?;
     conn.busy_timeout(Duration::from_secs(5))?;
+    migrate_plays(&conn);
     Ok(conn)
+}
+
+/// Colunas do histórico detalhado (o `ytm-local` cria as mesmas; aqui cobre o toca novo com banco antigo).
+const PLAYS_EXTRA: [(&str, &str); 7] = [
+    ("listened_s", "REAL"),
+    ("duration_s", "REAL"),
+    ("start_reason", "TEXT"),
+    ("end_reason", "TEXT"),
+    ("local", "INTEGER"),
+    ("title", "TEXT"),
+    ("artists", "TEXT"),
+];
+
+fn migrate_plays(conn: &Connection) {
+    let Ok(mut stmt) = conn.prepare("PRAGMA table_info(plays)") else { return };
+    let cols: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    if cols.is_empty() {
+        return; // tabela ainda não existe: o ytm-local a cria completa
+    }
+    for (name, ty) in PLAYS_EXTRA {
+        if !cols.iter().any(|c| c == name) {
+            let _ = conn.execute(&format!("ALTER TABLE plays ADD COLUMN {name} {ty}"), []);
+        }
+    }
 }
 
 const LOCAL: &str = "status='done' AND path IS NOT NULL";
@@ -66,8 +94,28 @@ pub fn counts(conn: &Connection) -> (i64, i64) {
     (q(&format!("SELECT COUNT(*) FROM tracks WHERE {LOCAL}")), q("SELECT COUNT(*) FROM tracks"))
 }
 
-pub fn record_play(conn: &Connection, id: &str) {
-    let _ = conn.execute("INSERT INTO plays (video_id) VALUES (?)", [id]);
+/// Reproduções registradas com tempo medido (as linhas antigas, sem `listened_s`, não entram).
+pub fn history_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM plays WHERE listened_s IS NOT NULL", [], |r| r.get(0)).unwrap_or(0)
+}
+
+/// Abre o registro da reprodução (o recommend já penaliza a faixa a partir daqui). Devolve o rowid.
+pub fn start_play(conn: &Connection, t: &Track, reason: &str) -> Option<i64> {
+    conn.execute(
+        "INSERT INTO plays (video_id, start_reason, local, title, artists) VALUES (?, ?, ?, ?, ?)",
+        rusqlite::params![t.id, reason, t.local as i64, t.title, t.artists],
+    )
+    .ok()?;
+    Some(conn.last_insert_rowid())
+}
+
+/// Atualiza o tempo ouvido; `end` só entra no fechamento (None mantém o que já está).
+pub fn update_play(conn: &Connection, row: i64, listened: f64, duration: f64, end: Option<&str>) {
+    let dur = if duration > 0.0 { Some(duration) } else { None };
+    let _ = conn.execute(
+        "UPDATE plays SET listened_s = ?, duration_s = ?, end_reason = COALESCE(?, end_reason) WHERE rowid = ?",
+        rusqlite::params![listened, dur, end, row],
+    );
 }
 
 fn volume_file() -> PathBuf {
@@ -92,4 +140,45 @@ pub fn save_volume(v: f64) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(f, format!("{}\n", v.round() as i64));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track() -> Track {
+        Track { id: "abc".into(), title: "Música".into(), artists: "Fulano".into(), local: true, path: None, thumb: None, online: false }
+    }
+
+    #[test]
+    fn historico_migra_abre_e_fecha() {
+        let conn = Connection::open_in_memory().unwrap();
+        // banco antigo: plays só com video_id e played_at, e uma linha já existente
+        conn.execute_batch(
+            "CREATE TABLE plays (video_id TEXT NOT NULL, played_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+             INSERT INTO plays (video_id) VALUES ('velha');",
+        )
+        .unwrap();
+        migrate_plays(&conn);
+        migrate_plays(&conn); // idempotente
+
+        let row = start_play(&conn, &track(), "card").unwrap();
+        update_play(&conn, row, 12.5, 200.0, None); // tique parcial: não define o fim
+        let (l, d, s, e): (f64, f64, String, Option<String>) = conn
+            .query_row("SELECT listened_s, duration_s, start_reason, end_reason FROM plays WHERE rowid=?", [row], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap();
+        assert_eq!((l, d, s.as_str(), e), (12.5, 200.0, "card", None));
+
+        update_play(&conn, row, 40.0, 200.0, Some("skip"));
+        update_play(&conn, row, 41.0, 200.0, None); // tique tardio não apaga o motivo do fim
+        let (l, e): (f64, String) = conn
+            .query_row("SELECT listened_s, end_reason FROM plays WHERE rowid=?", [row], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((l, e.as_str()), (41.0, "skip"));
+
+        let antigas: i64 = conn.query_row("SELECT COUNT(*) FROM plays WHERE listened_s IS NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(antigas, 1); // a linha antiga segue intacta
+    }
 }

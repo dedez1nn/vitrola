@@ -14,6 +14,8 @@ from .discover import discover
 from .recommend import recommend_now
 from .search import search as search_tracks
 from .similar import similar as similar_tracks
+from . import genre as genre_mod
+from .stats import report
 from .download import download_pending, estimate_bytes, pending_rows
 from .sync import sync
 
@@ -180,6 +182,25 @@ def cmd_search(args) -> None:
         print(f"{i:2}. {t['artists']} - {t['title']}  [{where}]")
 
 
+def cmd_stats(args) -> None:
+    print(report(connect(DB_FILE), top=args.top))
+
+
+def cmd_genres(args) -> None:
+    conn = connect(DB_FILE)
+    if args.action == "set":
+        if not args.rest or len(args.rest) < 2:
+            raise SystemExit('Uso: ytm-local genres set "Artista" gênero [gênero...]')
+        genre_mod.set_manual(conn, args.rest[0], args.rest[1:])
+        print(f"{args.rest[0]}: {', '.join(args.rest[1:])} (manual)")
+    elif args.action == "show":
+        for a, g in sorted(genre_mod.main_genre(conn).items()):
+            print(f"{a}: {g}")
+    else:
+        n = genre_mod.fetch_all(conn, everything=args.all, refresh=args.refresh)
+        print(f"{n} consultas com gênero encontrado (artista x fonte)")
+
+
 def cmd_status(args) -> None:
     conn = connect(DB_FILE)
     for r in conn.execute("SELECT status, COUNT(*) n FROM tracks GROUP BY status"):
@@ -250,6 +271,17 @@ def main() -> None:
     sm.add_argument("--library-only", action="store_true", help="só o que já está na sua biblioteca")
     sm.add_argument("--json", action="store_true", help="saída para o app")
     sm.set_defaults(fn=cmd_similar)
+
+    ss = sub.add_parser("stats", help="resumo do histórico de reprodução")
+    ss.add_argument("--top", type=int, default=10)
+    ss.set_defaults(fn=cmd_stats)
+
+    ge = sub.add_parser("genres", help="gênero por artista (iTunes/Deezer; ajuste manual com 'set')")
+    ge.add_argument("action", choices=["fetch", "set", "show"])
+    ge.add_argument("rest", nargs="*", help="set: \"Artista\" gênero [gênero...]")
+    ge.add_argument("--all", action="store_true", help="fetch: toda a biblioteca, não só quem já tocou")
+    ge.add_argument("--refresh", action="store_true", help="fetch: refaz consultas já feitas")
+    ge.set_defaults(fn=cmd_genres)
 
     st = sub.add_parser("status", help="resumo do estado")
     st.add_argument("--bitrate", type=int, default=256, help="kbps usado na estimativa de tamanho")
